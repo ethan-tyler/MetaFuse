@@ -1,0 +1,101 @@
+name: Feature Request
+description: Suggest a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature! Please provide as much detail as possible to help us understand your request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: Is your feature request related to a problem? Please describe.
+      placeholder: I'm frustrated when... / It would be helpful if...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like to see
+      placeholder: What should MetaFuse do differently or additionally?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Have you considered any alternative solutions or workarounds?
+      placeholder: What other approaches have you thought about?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      description: Which part of MetaFuse would this feature affect?
+      options:
+        - catalog-core
+        - catalog-storage
+        - catalog-emitter
+        - catalog-api
+        - catalog-cli
+        - Documentation
+        - Infrastructure
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority (Your Perspective)
+      description: How important is this feature to you?
+      options:
+        - Critical (blocking my use case)
+        - High (would significantly improve my workflow)
+        - Medium (nice to have)
+        - Low (minor improvement)
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case
+      description: Describe your specific use case for this feature
+      placeholder: How would you use this feature in practice?
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other context, examples, or references (links to similar features, etc.)
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to contribute this feature (with guidance)
+          required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
+        - label: I have reviewed the roadmap to see if this is already planned
+          required: true

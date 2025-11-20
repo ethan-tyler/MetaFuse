@@ -1,0 +1,13 @@
+[build]
+# Use a shared target directory for faster builds
+target-dir = "target"
+
+# Uncomment to enforce warnings as errors in CI
+# rustflags = ["-D", "warnings"]
+
+[alias]
+# Convenient aliases for common commands
+check-all = "check --workspace --all-features"
+test-all = "test --workspace --all-features"
+lint = "clippy --workspace --all-features -- -D warnings"
+fmt-check = "fmt --all -- --check"

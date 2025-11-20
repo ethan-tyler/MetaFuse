@@ -1,0 +1,25 @@
+[package]
+name = "metafuse-catalog-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Storage backend abstraction for MetaFuse catalog"
+
+[dependencies]
+metafuse-catalog-core = { path = "../catalog-core" }
+rusqlite.workspace = true
+thiserror.workspace = true
+
+# Future: GCS/S3 client libraries
+# google-cloud-storage = { version = "0.15", optional = true }
+# aws-sdk-s3 = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+default = []
+# gcs = ["google-cloud-storage"]
+# s3 = ["aws-sdk-s3"]

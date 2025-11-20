@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# MetaFuse catalog databases
+*.db
+*.db-shm
+*.db-wal
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Testing artifacts
+/tmp/
+*.tmp
+
+# Benchmarking results
+/benches/results/
+
+# Documentation builds
+/docs/_build/
+/docs/.doctrees/
+
+# Coverage reports
+/coverage/
+*.profraw
+*.profdata

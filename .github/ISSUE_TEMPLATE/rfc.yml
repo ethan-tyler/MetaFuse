@@ -1,0 +1,149 @@
+name: RFC (Request for Comments)
+description: Propose a significant change or design decision
+title: "[RFC]: "
+labels: ["rfc", "discussion"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Request for Comments (RFC)
+
+        Use this template for proposing significant changes that require design discussion and community feedback.
+
+        Examples:
+        - Major architectural changes
+        - New abstractions or APIs
+        - Breaking changes
+        - Significant feature additions
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One-paragraph explanation of the proposal
+      placeholder: This RFC proposes...
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why are we doing this? What use cases does it support? What is the expected outcome?
+      placeholder: |
+        - What problem does this solve?
+        - What use cases does it enable?
+        - Why should we invest resources in this?
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Detailed Design
+      description: Explain the design in sufficient detail for someone familiar with the project to implement
+      placeholder: |
+        Include:
+        - API changes (if applicable)
+        - Data structures
+        - Algorithms
+        - Examples of usage
+        - Edge cases
+    validations:
+      required: true
+
+  - type: textarea
+    id: drawbacks
+    attributes:
+      label: Drawbacks
+      description: Why should we *not* do this?
+      placeholder: |
+        - Complexity cost
+        - Maintenance burden
+        - Migration challenges
+        - Alternative approaches that might be better
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What other designs have been considered? What is the impact of not doing this?
+      placeholder: Alternative approaches considered...
+    validations:
+      required: false
+
+  - type: textarea
+    id: prior-art
+    attributes:
+      label: Prior Art
+      description: Is this done elsewhere? What can we learn from other projects?
+      placeholder: |
+        Examples from:
+        - Other data catalog systems
+        - DataFusion/Arrow ecosystem
+        - Rust libraries
+        - Industry standards
+    validations:
+      required: false
+
+  - type: textarea
+    id: unresolved
+    attributes:
+      label: Unresolved Questions
+      description: What parts of the design are still to be determined?
+      placeholder: |
+        - Open questions
+        - Implementation details that need exploration
+        - Trade-offs that need community input
+    validations:
+      required: false
+
+  - type: textarea
+    id: future
+    attributes:
+      label: Future Possibilities
+      description: How might this proposal enable future work?
+      placeholder: This could later enable...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: What is the expected scope of this change?
+      options:
+        - Breaking change (requires major version bump)
+        - Significant addition (new feature or API)
+        - Internal refactoring (no user-facing changes)
+        - Documentation or process change
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Impact Areas
+      description: Which areas does this RFC impact?
+      options:
+        - label: API compatibility
+        - label: Performance
+        - label: Security
+        - label: Storage format
+        - label: Documentation
+        - label: Testing infrastructure
+        - label: Build/CI process
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing RFCs and issues
+          required: true
+        - label: I have provided sufficient detail for discussion
+          required: true
+        - label: I am prepared to engage in discussion and iteration
+          required: true

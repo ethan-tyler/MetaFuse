@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: GitHub Discussions
+    url: https://github.com/[USERNAME]/metafuse/discussions
+    about: Ask questions and discuss ideas with the community
+  - name: Documentation
+    url: https://github.com/[USERNAME]/metafuse/tree/main/docs
+    about: Read the project documentation
+  - name: Security Issues
+    url: https://github.com/[USERNAME]/metafuse/security/policy
+    about: Report security vulnerabilities privately

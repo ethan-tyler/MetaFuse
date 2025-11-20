@@ -1,0 +1,19 @@
+[package]
+name = "metafuse-catalog-emitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "DataFusion integration for MetaFuse catalog"
+
+[dependencies]
+metafuse-catalog-core = { path = "../catalog-core" }
+metafuse-catalog-storage = { path = "../catalog-storage" }
+chrono.workspace = true
+datafusion.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
