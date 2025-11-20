@@ -18,7 +18,7 @@ This project adheres to the [Contributor Covenant Code of Conduct](CODE_OF_CONDU
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/[USERNAME]/metafuse.git
+   git clone https://github.com/ethan-tyler/MetaFuse.git
    cd metafuse
    ```
 
@@ -145,16 +145,16 @@ If this passes locally, it will pass in CI.
 
 ```
 MetaFuse/
-├── crates/
-│   ├── catalog-core/      # Core types, schema, errors
-│   ├── catalog-storage/   # Storage backend abstraction
-│   ├── catalog-emitter/   # DataFusion integration
-│   ├── catalog-api/       # REST API (Axum)
-│   └── catalog-cli/       # CLI tool (Clap)
-├── docs/                  # Documentation
-├── examples/              # Runnable examples
-├── tests/                 # Integration tests
-└── benches/               # Performance benchmarks
+|-- crates/
+|   |-- catalog-core/      # Core types, schema, errors
+|   |-- catalog-storage/   # Storage backend abstraction
+|   |-- catalog-emitter/   # DataFusion integration
+|   |-- catalog-api/       # REST API (Axum)
+|   `-- catalog-cli/       # CLI tool (Clap)
+|-- docs/                  # Documentation
+|-- examples/              # Runnable examples
+|-- tests/                 # Integration tests
+`-- benches/               # Performance benchmarks
 ```
 
 ## Areas for Contribution
@@ -215,8 +215,8 @@ cargo bench --features bench
 
 ## Questions?
 
-- Open a [Discussion](https://github.com/[USERNAME]/metafuse/discussions) for questions
-- Open an [Issue](https://github.com/[USERNAME]/metafuse/issues) for bug reports or feature requests
+- Open a [Discussion](https://github.com/ethan-tyler/MetaFuse/discussions) for questions
+- Open an [Issue](https://github.com/ethan-tyler/MetaFuse/issues) for bug reports or feature requests
 - Review the [documentation](docs/) for technical details
 
 ## License

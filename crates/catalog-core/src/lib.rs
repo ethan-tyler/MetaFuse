@@ -14,6 +14,8 @@ pub struct DatasetMeta {
     pub path: String,
     /// Format of the dataset (e.g., "parquet", "delta", "iceberg", "csv")
     pub format: String,
+    /// Optional human-readable description
+    pub description: Option<String>,
     /// Tenant identifier for multi-tenant deployments
     pub tenant: Option<String>,
     /// Business domain (e.g., "finance", "marketing", "operations")
@@ -98,6 +100,7 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
       name TEXT UNIQUE NOT NULL,
       path TEXT NOT NULL,
       format TEXT NOT NULL,
+      description TEXT,
       tenant TEXT,
       domain TEXT,
       owner TEXT,
@@ -184,27 +187,10 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
       path,
       domain,
       owner,
+      description,
       tags,
-      field_names,
-      content=datasets,
-      content_rowid=id
+      field_names
     );
-
-    -- Triggers to keep FTS index up to date
-    CREATE TRIGGER IF NOT EXISTS dataset_search_insert AFTER INSERT ON datasets BEGIN
-      INSERT INTO dataset_search(rowid, dataset_name, path, domain, owner)
-      VALUES (new.id, new.name, new.path, new.domain, new.owner);
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS dataset_search_delete AFTER DELETE ON datasets BEGIN
-      DELETE FROM dataset_search WHERE rowid = old.id;
-    END;
-
-    CREATE TRIGGER IF NOT EXISTS dataset_search_update AFTER UPDATE ON datasets BEGIN
-      DELETE FROM dataset_search WHERE rowid = old.id;
-      INSERT INTO dataset_search(rowid, dataset_name, path, domain, owner)
-      VALUES (new.id, new.name, new.path, new.domain, new.owner);
-    END;
     "#;
 
     conn.execute_batch(ddl)?;

@@ -54,6 +54,7 @@ impl<B: CatalogBackend> Emitter<B> {
     /// * `name` - Unique name for the dataset
     /// * `path` - Storage path (e.g., "s3://bucket/path" or "gs://bucket/path")
     /// * `format` - Format type ("parquet", "delta", "iceberg", "csv", etc.)
+    /// * `description` - Optional human-readable description
     /// * `tenant` - Optional tenant identifier for multi-tenant deployments
     /// * `domain` - Optional business domain ("finance", "marketing", etc.)
     /// * `owner` - Optional owner/responsible party
@@ -68,6 +69,7 @@ impl<B: CatalogBackend> Emitter<B> {
         name: &str,
         path: &str,
         format: &str,
+        description: Option<&str>,
         tenant: Option<&str>,
         domain: Option<&str>,
         owner: Option<&str>,
@@ -95,6 +97,7 @@ impl<B: CatalogBackend> Emitter<B> {
             name: name.to_string(),
             path: path.to_string(),
             format: format.to_string(),
+            description: description.map(|s| s.to_string()),
             tenant: tenant.map(|s| s.to_string()),
             domain: domain.map(|s| s.to_string()),
             owner: owner.map(|s| s.to_string()),
@@ -114,19 +117,19 @@ impl<B: CatalogBackend> Emitter<B> {
 
     /// Write dataset metadata to the catalog
     fn write_dataset(&self, dataset: &DatasetMeta) -> Result<()> {
-        let conn = self.backend.get_connection()?;
+        let mut conn = self.backend.get_connection()?;
 
-        // Start transaction
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction()?;
 
         // Insert or update dataset
         tx.execute(
             r#"
-            INSERT INTO datasets (name, path, format, tenant, domain, owner, created_at, last_updated, row_count, size_bytes)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            INSERT INTO datasets (name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(name) DO UPDATE SET
                 path = excluded.path,
                 format = excluded.format,
+                description = excluded.description,
                 tenant = excluded.tenant,
                 domain = excluded.domain,
                 owner = excluded.owner,
@@ -138,6 +141,7 @@ impl<B: CatalogBackend> Emitter<B> {
                 dataset.name,
                 dataset.path,
                 dataset.format,
+                dataset.description,
                 dataset.tenant,
                 dataset.domain,
                 dataset.owner,
@@ -209,6 +213,37 @@ impl<B: CatalogBackend> Emitter<B> {
             )?;
         }
 
+        // Refresh FTS index entry for this dataset
+        tx.execute(
+            "DELETE FROM dataset_search WHERE dataset_name = ?1",
+            [&dataset.name],
+        )?;
+
+        let field_names = dataset
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let tag_string = dataset.tags.join(" ");
+
+        tx.execute(
+            r#"
+            INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            rusqlite::params![
+                dataset.name,
+                dataset.path,
+                dataset.domain,
+                dataset.owner,
+                dataset.description,
+                tag_string,
+                field_names
+            ],
+        )?;
+
         // Commit transaction
         tx.commit()?;
 
@@ -246,6 +281,7 @@ mod tests {
                 "test_dataset",
                 "s3://test-bucket/data",
                 "parquet",
+                Some("Test dataset for emitter"),
                 Some("test-tenant"),
                 Some("analytics"),
                 Some("test@example.com"),
@@ -291,6 +327,7 @@ mod tests {
                 "upstream",
                 "s3://bucket/upstream",
                 "parquet",
+                Some("Upstream dataset"),
                 None,
                 None,
                 None,
@@ -308,6 +345,7 @@ mod tests {
                 "downstream",
                 "s3://bucket/downstream",
                 "parquet",
+                Some("Downstream dataset"),
                 None,
                 None,
                 None,

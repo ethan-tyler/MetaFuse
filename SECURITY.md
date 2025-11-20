@@ -20,7 +20,7 @@ We take the security of MetaFuse seriously. If you believe you have found a secu
 
 Instead, please email security concerns to:
 
-**[INSERT CONTACT EMAIL]**
+**ethan@urbanskitech.com**
 
 You should receive a response within **24-48 hours** for critical issues. If for some reason you do not, please follow up to ensure we received your original message.
 
@@ -91,7 +91,7 @@ Our development process includes:
 ## Contact
 
 For non-security-related questions, please use:
-* GitHub Issues: [https://github.com/[USERNAME]/metafuse/issues](https://github.com/[USERNAME]/metafuse/issues)
-* GitHub Discussions: [https://github.com/[USERNAME]/metafuse/discussions](https://github.com/[USERNAME]/metafuse/discussions)
+* GitHub Issues: [https://github.com/ethan-tyler/MetaFuse/issues](https://github.com/ethan-tyler/MetaFuse/issues)
+* GitHub Discussions: [https://github.com/ethan-tyler/MetaFuse/discussions](https://github.com/ethan-tyler/MetaFuse/discussions)
 
-For security issues only: **[INSERT CONTACT EMAIL]**
+For security issues only: **ethan@urbanskitech.com**

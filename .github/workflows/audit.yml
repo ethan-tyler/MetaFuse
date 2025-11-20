@@ -1,0 +1,43 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+
+jobs:
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+
+      - name: Run cargo audit
+        # Allow this to fail without blocking PR merges
+        # cargo audit requires network access and may fail in restricted environments
+        # Vulnerabilities should be addressed but don't need to block development
+        continue-on-error: true
+        run: cargo audit
+
+      - name: Check for unmaintained dependencies
+        continue-on-error: true
+        run: cargo audit --deny unmaintained
+
+      - name: Comment on failure
+        if: failure()
+        run: |
+          echo "::warning::cargo audit found security vulnerabilities or unmaintained dependencies."
+          echo "::warning::This is informational and does not block the build."
+          echo "::warning::Please review the findings and create issues for any critical vulnerabilities."

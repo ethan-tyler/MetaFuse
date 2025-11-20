@@ -32,6 +32,7 @@ pub trait CatalogBackend: Send + Sync {
 ///
 /// Stores the catalog as a SQLite file on the local filesystem.
 /// This is the primary backend for MVP and local development.
+#[derive(Clone, Debug)]
 pub struct LocalSqliteBackend {
     /// Path to the SQLite database file
     path: PathBuf,

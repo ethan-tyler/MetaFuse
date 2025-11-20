@@ -3,22 +3,30 @@
 //! REST API for querying the MetaFuse catalog.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use metafuse_catalog_storage::{CatalogBackend, LocalSqliteBackend};
+use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::EnvFilter;
 
 /// Application state shared across handlers
-#[derive(Clone)]
 struct AppState<B: CatalogBackend> {
     backend: Arc<B>,
+}
+
+impl<B: CatalogBackend> Clone for AppState<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+        }
+    }
 }
 
 /// Dataset response structure
@@ -28,6 +36,7 @@ struct DatasetResponse {
     name: String,
     path: String,
     format: String,
+    description: Option<String>,
     tenant: Option<String>,
     domain: Option<String>,
     owner: Option<String>,
@@ -73,8 +82,9 @@ async fn main() {
         .init();
 
     // Get catalog path from environment or use default
-    let catalog_path =
-        std::env::var("METAFUSE_CATALOG_PATH").unwrap_or_else(|_| "metafuse_catalog.db".to_string());
+    let catalog_path = std::env::var("METAFUSE_CATALOG_PATH")
+        .or_else(|_| std::env::var("METAFUSE_CATALOG"))
+        .unwrap_or_else(|_| "metafuse_catalog.db".to_string());
 
     tracing::info!("Using catalog at: {}", catalog_path);
 
@@ -100,7 +110,8 @@ async fn main() {
         .with_state(state);
 
     // Get port from environment or use default
-    let port = std::env::var("PORT")
+    let port = std::env::var("METAFUSE_PORT")
+        .or_else(|_| std::env::var("PORT"))
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()
         .expect("PORT must be a valid number");
@@ -120,37 +131,55 @@ async fn health_check() -> &'static str {
 /// List all datasets
 async fn list_datasets<B: CatalogBackend>(
     State(state): State<AppState<B>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let conn = state
         .backend
         .get_connection()
         .map_err(|e| internal_error(e.to_string()))?;
 
+    let mut query = String::from(
+        r#"
+        SELECT id, name, path, format, description, tenant, domain, owner,
+               created_at, last_updated, row_count, size_bytes
+        FROM datasets
+        WHERE 1=1
+        "#,
+    );
+
+    let mut bindings: Vec<String> = Vec::new();
+
+    if let Some(tenant) = params.get("tenant") {
+        query.push_str(" AND tenant = ?");
+        bindings.push(tenant.clone());
+    }
+
+    if let Some(domain) = params.get("domain") {
+        query.push_str(" AND domain = ?");
+        bindings.push(domain.clone());
+    }
+
+    query.push_str(" ORDER BY last_updated DESC");
+
     let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT id, name, path, format, tenant, domain, owner,
-                   created_at, last_updated, row_count, size_bytes
-            FROM datasets
-            ORDER BY last_updated DESC
-            "#,
-        )
+        .prepare(&query)
         .map_err(|e| internal_error(e.to_string()))?;
 
     let datasets = stmt
-        .query_map([], |row| {
+        .query_map(params_from_iter(bindings.iter()), |row| {
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
                 format: row.get(3)?,
-                tenant: row.get(4)?,
-                domain: row.get(5)?,
-                owner: row.get(6)?,
-                created_at: row.get(7)?,
-                last_updated: row.get(8)?,
-                row_count: row.get(9)?,
-                size_bytes: row.get(10)?,
+                description: row.get(4)?,
+                tenant: row.get(5)?,
+                domain: row.get(6)?,
+                owner: row.get(7)?,
+                created_at: row.get(8)?,
+                last_updated: row.get(9)?,
+                row_count: row.get(10)?,
+                size_bytes: row.get(11)?,
             })
         })
         .map_err(|e| internal_error(e.to_string()))?
@@ -174,7 +203,7 @@ async fn get_dataset<B: CatalogBackend>(
     let dataset: DatasetResponse = conn
         .query_row(
             r#"
-            SELECT id, name, path, format, tenant, domain, owner,
+            SELECT id, name, path, format, description, tenant, domain, owner,
                    created_at, last_updated, row_count, size_bytes
             FROM datasets
             WHERE name = ?1
@@ -186,13 +215,14 @@ async fn get_dataset<B: CatalogBackend>(
                     name: row.get(1)?,
                     path: row.get(2)?,
                     format: row.get(3)?,
-                    tenant: row.get(4)?,
-                    domain: row.get(5)?,
-                    owner: row.get(6)?,
-                    created_at: row.get(7)?,
-                    last_updated: row.get(8)?,
-                    row_count: row.get(9)?,
-                    size_bytes: row.get(10)?,
+                    description: row.get(4)?,
+                    tenant: row.get(5)?,
+                    domain: row.get(6)?,
+                    owner: row.get(7)?,
+                    created_at: row.get(8)?,
+                    last_updated: row.get(9)?,
+                    row_count: row.get(10)?,
+                    size_bytes: row.get(11)?,
                 })
             },
         )
@@ -275,7 +305,7 @@ async fn get_dataset<B: CatalogBackend>(
 /// Search datasets using FTS
 async fn search_datasets<B: CatalogBackend>(
     State(state): State<AppState<B>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let query = params
         .get("q")
@@ -289,12 +319,12 @@ async fn search_datasets<B: CatalogBackend>(
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT d.id, d.name, d.path, d.format, d.tenant, d.domain, d.owner,
+            SELECT d.id, d.name, d.path, d.format, d.description, d.tenant, d.domain, d.owner,
                    d.created_at, d.last_updated, d.row_count, d.size_bytes
             FROM datasets d
-            JOIN dataset_search s ON d.id = s.rowid
+            JOIN dataset_search s ON d.name = s.dataset_name
             WHERE dataset_search MATCH ?1
-            ORDER BY rank
+            ORDER BY bm25(dataset_search)
             "#,
         )
         .map_err(|e| internal_error(e.to_string()))?;
@@ -306,13 +336,14 @@ async fn search_datasets<B: CatalogBackend>(
                 name: row.get(1)?,
                 path: row.get(2)?,
                 format: row.get(3)?,
-                tenant: row.get(4)?,
-                domain: row.get(5)?,
-                owner: row.get(6)?,
-                created_at: row.get(7)?,
-                last_updated: row.get(8)?,
-                row_count: row.get(9)?,
-                size_bytes: row.get(10)?,
+                description: row.get(4)?,
+                tenant: row.get(5)?,
+                domain: row.get(6)?,
+                owner: row.get(7)?,
+                created_at: row.get(8)?,
+                last_updated: row.get(9)?,
+                row_count: row.get(10)?,
+                size_bytes: row.get(11)?,
             })
         })
         .map_err(|e| internal_error(e.to_string()))?
@@ -332,7 +363,10 @@ fn internal_error(message: String) -> (StatusCode, Json<ErrorResponse>) {
 
 /// Helper function to create not found error response
 fn not_found(message: String) -> (StatusCode, Json<ErrorResponse>) {
-    (StatusCode::NOT_FOUND, Json(ErrorResponse { error: message }))
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse { error: message }),
+    )
 }
 
 /// Helper function to create bad request error response

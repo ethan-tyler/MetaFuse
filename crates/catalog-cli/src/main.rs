@@ -98,7 +98,7 @@ fn init_catalog(path: &str, force: bool) -> Result<(), Box<dyn std::error::Error
     }
 
     backend.initialize()?;
-    println!("✓ Initialized catalog at '{}'", path);
+    println!("Initialized catalog at '{}'", path);
 
     Ok(())
 }
@@ -113,7 +113,7 @@ fn list_datasets(
     let conn = backend.get_connection()?;
 
     let mut query = String::from(
-        "SELECT name, path, format, tenant, domain, owner, last_updated, row_count, size_bytes FROM datasets WHERE 1=1",
+        "SELECT name, path, format, description, tenant, domain, owner, last_updated, row_count, size_bytes FROM datasets WHERE 1=1",
     );
 
     let mut params: Vec<String> = Vec::new();
@@ -137,15 +137,16 @@ fn list_datasets(
 
     let datasets = stmt.query_map(param_refs.as_slice(), |row| {
         Ok((
-            row.get::<_, String>(0)?,   // name
-            row.get::<_, String>(1)?,   // path
-            row.get::<_, String>(2)?,   // format
-            row.get::<_, Option<String>>(3)?, // tenant
-            row.get::<_, Option<String>>(4)?, // domain
-            row.get::<_, Option<String>>(5)?, // owner
-            row.get::<_, String>(6)?,   // last_updated
-            row.get::<_, Option<i64>>(7)?, // row_count
-            row.get::<_, Option<i64>>(8)?, // size_bytes
+            row.get::<_, String>(0)?,         // name
+            row.get::<_, String>(1)?,         // path
+            row.get::<_, String>(2)?,         // format
+            row.get::<_, Option<String>>(3)?, // description
+            row.get::<_, Option<String>>(4)?, // tenant
+            row.get::<_, Option<String>>(5)?, // domain
+            row.get::<_, Option<String>>(6)?, // owner
+            row.get::<_, String>(7)?,         // last_updated
+            row.get::<_, Option<i64>>(8)?,    // row_count
+            row.get::<_, Option<i64>>(9)?,    // size_bytes
         ))
     })?;
 
@@ -153,13 +154,26 @@ fn list_datasets(
     println!();
 
     for dataset in datasets {
-        let (name, path, format, tenant, domain, owner, last_updated, row_count, size_bytes) =
-            dataset?;
+        let (
+            name,
+            path,
+            format,
+            description,
+            tenant,
+            domain,
+            owner,
+            last_updated,
+            row_count,
+            size_bytes,
+        ) = dataset?;
 
         if verbose {
             println!("  Name: {}", name);
             println!("  Path: {}", path);
             println!("  Format: {}", format);
+            if let Some(desc) = description {
+                println!("  Description: {}", desc);
+            }
             if let Some(t) = tenant {
                 println!("  Tenant: {}", t);
             }
@@ -199,7 +213,7 @@ fn show_dataset(
 
     // Get dataset info
     let dataset: Result<_, rusqlite::Error> = conn.query_row(
-        "SELECT name, path, format, tenant, domain, owner, created_at, last_updated, row_count, size_bytes FROM datasets WHERE name = ?1",
+        "SELECT name, path, format, description, tenant, domain, owner, created_at, last_updated, row_count, size_bytes FROM datasets WHERE name = ?1",
         [name],
         |row| {
             Ok((
@@ -209,20 +223,35 @@ fn show_dataset(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
-                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, String>(8)?,
                 row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         },
     );
 
-    let (name, path, format, tenant, domain, owner, created_at, last_updated, row_count, size_bytes) =
-        dataset?;
+    let (
+        name,
+        path,
+        format,
+        description,
+        tenant,
+        domain,
+        owner,
+        created_at,
+        last_updated,
+        row_count,
+        size_bytes,
+    ) = dataset?;
 
     println!("Dataset: {}", name);
     println!("Path: {}", path);
     println!("Format: {}", format);
+    if let Some(desc) = description {
+        println!("Description: {}", desc);
+    }
     if let Some(t) = tenant {
         println!("Tenant: {}", t);
     }
@@ -242,9 +271,10 @@ fn show_dataset(
     }
 
     // Get fields
-    let dataset_id: i64 = conn.query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
-        row.get(0)
-    })?;
+    let dataset_id: i64 =
+        conn.query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })?;
 
     println!("\nFields:");
     let mut stmt =
@@ -259,7 +289,11 @@ fn show_dataset(
 
     for field in fields {
         let (field_name, data_type, nullable) = field?;
-        let null_str = if nullable != 0 { "nullable" } else { "not null" };
+        let null_str = if nullable != 0 {
+            "nullable"
+        } else {
+            "not null"
+        };
         println!("  {} ({}, {})", field_name, data_type, null_str);
     }
 
@@ -285,7 +319,7 @@ fn show_dataset(
         if !upstream.is_empty() {
             println!("\nUpstream datasets:");
             for u in upstream {
-                println!("  ← {}", u);
+                println!("  <- {}", u);
             }
         }
 
@@ -300,7 +334,7 @@ fn show_dataset(
         if !downstream.is_empty() {
             println!("\nDownstream datasets:");
             for d in downstream {
-                println!("  → {}", d);
+                println!("  -> {}", d);
             }
         }
     }
@@ -350,9 +384,11 @@ fn show_stats(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let backend = LocalSqliteBackend::new(path);
     let conn = backend.get_connection()?;
 
-    let dataset_count: i64 = conn.query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))?;
+    let dataset_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))?;
     let field_count: i64 = conn.query_row("SELECT COUNT(*) FROM fields", [], |row| row.get(0))?;
-    let lineage_count: i64 = conn.query_row("SELECT COUNT(*) FROM lineage", [], |row| row.get(0))?;
+    let lineage_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM lineage", [], |row| row.get(0))?;
     let tag_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))?;
 
     println!("Catalog Statistics:");
