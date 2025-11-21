@@ -5,8 +5,8 @@
 use chrono::Utc;
 use datafusion::arrow::datatypes::SchemaRef;
 use metafuse_catalog_core::{
-    increment_catalog_version, init_sqlite_schema, CatalogError, DatasetMeta, FieldMeta,
-    OperationalMeta, Result,
+    get_catalog_version, increment_catalog_version, init_sqlite_schema, CatalogError, DatasetMeta,
+    FieldMeta, OperationalMeta, Result,
 };
 use metafuse_catalog_storage::CatalogBackend;
 use rusqlite::Connection;
@@ -126,17 +126,25 @@ impl<B: CatalogBackend> Emitter<B> {
     /// Write dataset metadata to the catalog with optimistic concurrency control
     ///
     /// This implements the download-modify-upload pattern with retry logic:
-    /// 1. Download catalog from backend (captures version metadata)
+    /// 1. Download catalog from backend (captures current version)
     /// 2. Perform writes in a transaction
-    /// 3. Upload modified catalog with version preconditions
-    /// 4. If upload fails due to conflict, retry with exponential backoff
+    /// 3. Validate catalog version was incremented
+    /// 4. Upload modified catalog with version preconditions
+    /// 5. If upload fails due to conflict, retry with exponential backoff
     fn write_dataset(&self, dataset: &DatasetMeta) -> Result<()> {
         const MAX_RETRIES: u32 = 3;
         let mut retry_count = 0;
 
         loop {
-            // Download catalog (local backends return existing path, cloud backends download to temp)
+            // Download catalog (captures current version and remote metadata)
             let download = self.backend.download()?;
+            let expected_version = download.catalog_version;
+
+            tracing::debug!(
+                dataset = %dataset.name,
+                version = expected_version,
+                "Downloaded catalog for write"
+            );
 
             // Open connection to the downloaded catalog
             let mut conn = Connection::open(&download.path)?;
@@ -148,19 +156,46 @@ impl<B: CatalogBackend> Emitter<B> {
             self.write_dataset_tx(&tx, dataset)?;
             tx.commit()?;
 
+            // Verify version was incremented (sanity check)
+            let new_version = get_catalog_version(&conn)?;
+            if new_version <= expected_version {
+                return Err(CatalogError::Other(format!(
+                    "Catalog version not incremented: expected > {}, got {}",
+                    expected_version, new_version
+                )));
+            }
+
+            tracing::debug!(
+                dataset = %dataset.name,
+                old_version = expected_version,
+                new_version = new_version,
+                "Catalog version incremented"
+            );
+
             // Upload the modified catalog with optimistic locking
             match self.backend.upload(&download) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    tracing::info!(
+                        dataset = %dataset.name,
+                        version = new_version,
+                        "Dataset metadata emitted successfully"
+                    );
+                    return Ok(());
+                }
                 Err(CatalogError::ConflictError(msg)) if retry_count < MAX_RETRIES => {
                     retry_count += 1;
                     // Exponential backoff: 100ms, 200ms, 400ms
                     let backoff_ms = 100 * 2_u64.pow(retry_count - 1);
+                    tracing::warn!(
+                        dataset = %dataset.name,
+                        retry = retry_count,
+                        max_retries = MAX_RETRIES,
+                        backoff_ms = backoff_ms,
+                        error = %msg,
+                        "Catalog conflict detected, retrying..."
+                    );
                     thread::sleep(Duration::from_millis(backoff_ms));
                     // Loop will retry with fresh download
-                    eprintln!(
-                        "Catalog conflict detected ({}), retrying {}/{}...",
-                        msg, retry_count, MAX_RETRIES
-                    );
                 }
                 Err(CatalogError::ConflictError(msg)) => {
                     return Err(CatalogError::ConflictError(format!(
@@ -174,12 +209,7 @@ impl<B: CatalogBackend> Emitter<B> {
     }
 
     /// Perform dataset writes within a transaction
-    fn write_dataset_tx(
-        &self,
-        tx: &rusqlite::Transaction,
-        dataset: &DatasetMeta,
-    ) -> Result<()> {
-
+    fn write_dataset_tx(&self, tx: &rusqlite::Transaction, dataset: &DatasetMeta) -> Result<()> {
         // Extract operational metadata
         let (row_count, size_bytes, partition_keys_json) = if let Some(ref op) = dataset.operational
         {
@@ -187,8 +217,10 @@ impl<B: CatalogBackend> Emitter<B> {
                 None
             } else {
                 // Store as JSON array for proper structure and no delimiter issues
-                Some(serde_json::to_string(&op.partition_keys)
-                    .map_err(|e| CatalogError::SerializationError(e.to_string()))?)
+                Some(
+                    serde_json::to_string(&op.partition_keys)
+                        .map_err(|e| CatalogError::SerializationError(e.to_string()))?,
+                )
             };
             (op.row_count, op.size_bytes, partition_keys_json)
         } else {
@@ -289,36 +321,8 @@ impl<B: CatalogBackend> Emitter<B> {
             )?;
         }
 
-        // Refresh FTS index entry for this dataset
-        tx.execute(
-            "DELETE FROM dataset_search WHERE dataset_name = ?1",
-            [&dataset.name],
-        )?;
-
-        let field_names = dataset
-            .fields
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let tag_string = dataset.tags.join(" ");
-
-        tx.execute(
-            r#"
-            INSERT INTO dataset_search (dataset_name, path, domain, owner, description, tags, field_names)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            "#,
-            rusqlite::params![
-                dataset.name,
-                dataset.path,
-                dataset.domain,
-                dataset.owner,
-                dataset.description,
-                tag_string,
-                field_names
-            ],
-        )?;
+        // NOTE: FTS index is automatically maintained by triggers on datasets/fields/tags tables.
+        // No manual dataset_search insert/delete needed here.
 
         // Increment catalog version for optimistic concurrency control
         increment_catalog_version(&tx)?;

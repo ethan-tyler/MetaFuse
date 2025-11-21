@@ -27,8 +27,10 @@ pub struct ObjectVersion {
 pub struct CatalogDownload {
     /// Local filesystem path to the downloaded (or existing) SQLite file.
     pub path: PathBuf,
-    /// Optional remote version metadata to be used on upload for precondition checks.
-    pub version: Option<ObjectVersion>,
+    /// Catalog version from catalog_meta table for optimistic concurrency
+    pub catalog_version: i64,
+    /// Optional remote version metadata (generation/ETag) for cloud backends
+    pub remote_version: Option<ObjectVersion>,
 }
 
 /// Backend abstraction for catalog storage
@@ -198,9 +200,18 @@ impl LocalSqliteBackend {
 
 impl CatalogBackend for LocalSqliteBackend {
     fn download(&self) -> Result<CatalogDownload> {
+        // Open connection to read current version
+        let conn = Connection::open(&self.path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        init_sqlite_schema(&conn)?;
+
+        // Read current catalog version
+        let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
+
         Ok(CatalogDownload {
             path: self.path.clone(),
-            version: None,
+            catalog_version,
+            remote_version: None, // Local backend has no remote versioning
         })
     }
 
@@ -253,6 +264,16 @@ impl CatalogBackend for LocalSqliteBackend {
 /// 2. Open local connection
 /// 3. Perform operations
 /// 4. Upload back to GCS with generation number check (optimistic concurrency)
+///
+/// ## Feature Flag (Not Yet Implemented)
+///
+/// To enable GCS support, add a feature flag to Cargo.toml:
+/// ```toml
+/// [features]
+/// gcs = ["object_store/gcp"]
+/// ```
+///
+/// Real implementation should use the `object_store` crate for unified cloud storage access.
 #[allow(dead_code)]
 pub struct GcsBackend {
     bucket: String,
@@ -287,31 +308,40 @@ impl CatalogBackend for GcsBackend {
         ))
     }
 
-    fn upload(&self, _download: &CatalogDownload) -> Result<()> {
+    fn upload(&self, download: &CatalogDownload) -> Result<()> {
         // TODO: Implement upload with generation precondition checks for optimistic concurrency.
         // Example implementation:
-        // 1. Check if download.version has a generation number
-        // 2. Upload file with if-generation-match precondition set to the captured generation
-        // 3. If GCS returns 412 Precondition Failed, return CatalogError::ConflictError
-        // 4. If upload succeeds, the generation number is automatically incremented by GCS
+        // 1. Validate catalog_version was incremented (sanity check)
+        // 2. Extract generation number from download.remote_version
+        // 3. Upload file with if-generation-match precondition set to the captured generation
+        // 4. If GCS returns 412 Precondition Failed, return CatalogError::ConflictError
+        // 5. If upload succeeds, the generation number is automatically incremented by GCS
         //
         // Pseudocode:
-        // if let Some(version) = &download.version {
-        //     if let Some(generation) = &version.generation {
-        //         let request = storage_client.upload()
-        //             .bucket(&self.bucket)
-        //             .object(&self.path)
-        //             .if_generation_match(generation.parse::<i64>()?)
-        //             .file(&download.path);
-        //         match request.send().await {
-        //             Ok(_) => Ok(()),
-        //             Err(e) if is_precondition_failed(&e) => {
-        //                 Err(CatalogError::ConflictError("Catalog was modified by another process".into()))
-        //             }
-        //             Err(e) => Err(e.into()),
-        //         }
+        // let Some(remote_version) = &download.remote_version else {
+        //     return Err(CatalogError::Other("Missing remote version for upload".into()));
+        // };
+        // let Some(generation) = &remote_version.generation else {
+        //     return Err(CatalogError::Other("Missing generation for GCS upload".into()));
+        // };
+        //
+        // let request = storage_client.upload()
+        //     .bucket(&self.bucket)
+        //     .object(&self.path)
+        //     .if_generation_match(generation.parse::<i64>()?)
+        //     .file(&download.path);
+        //
+        // match request.send().await {
+        //     Ok(_) => Ok(()),
+        //     Err(e) if is_precondition_failed(&e) => {
+        //         Err(CatalogError::ConflictError(format!(
+        //             "Catalog was modified by another process (expected generation: {})",
+        //             generation
+        //         )))
         //     }
+        //     Err(e) => Err(e.into()),
         // }
+        let _ = download; // Silence unused warning
         Err(CatalogError::Other(
             "GCS backend not implemented; enable gcs feature and add upload logic".to_string(),
         ))
@@ -342,6 +372,16 @@ impl CatalogBackend for GcsBackend {
 /// S3 backend for catalog storage (future implementation)
 ///
 /// Similar to GCS backend but using AWS S3.
+///
+/// ## Feature Flag (Not Yet Implemented)
+///
+/// To enable S3 support, add a feature flag to Cargo.toml:
+/// ```toml
+/// [features]
+/// s3 = ["object_store/aws"]
+/// ```
+///
+/// Real implementation should use the `object_store` crate for unified cloud storage access.
 #[allow(dead_code)]
 pub struct S3Backend {
     bucket: String,
@@ -379,31 +419,40 @@ impl CatalogBackend for S3Backend {
         ))
     }
 
-    fn upload(&self, _download: &CatalogDownload) -> Result<()> {
+    fn upload(&self, download: &CatalogDownload) -> Result<()> {
         // TODO: Implement upload with ETag precondition checks for optimistic concurrency.
         // Example implementation:
-        // 1. Check if download.version has an ETag
-        // 2. Upload file with if-match precondition set to the captured ETag
-        // 3. If S3 returns 412 Precondition Failed, return CatalogError::ConflictError
-        // 4. If upload succeeds, S3 generates a new ETag for the updated object
+        // 1. Validate catalog_version was incremented (sanity check)
+        // 2. Extract ETag from download.remote_version
+        // 3. Upload file with if-match precondition set to the captured ETag
+        // 4. If S3 returns 412 Precondition Failed, return CatalogError::ConflictError
+        // 5. If upload succeeds, S3 generates a new ETag for the updated object
         //
         // Pseudocode:
-        // if let Some(version) = &download.version {
-        //     if let Some(etag) = &version.etag {
-        //         let request = s3_client.put_object()
-        //             .bucket(&self.bucket)
-        //             .key(&self.path)
-        //             .if_match(etag)
-        //             .body(ByteStream::from_path(&download.path).await?);
-        //         match request.send().await {
-        //             Ok(_) => Ok(()),
-        //             Err(e) if is_precondition_failed(&e) => {
-        //                 Err(CatalogError::ConflictError("Catalog was modified by another process".into()))
-        //             }
-        //             Err(e) => Err(e.into()),
-        //         }
+        // let Some(remote_version) = &download.remote_version else {
+        //     return Err(CatalogError::Other("Missing remote version for upload".into()));
+        // };
+        // let Some(etag) = &remote_version.etag else {
+        //     return Err(CatalogError::Other("Missing ETag for S3 upload".into()));
+        // };
+        //
+        // let request = s3_client.put_object()
+        //     .bucket(&self.bucket)
+        //     .key(&self.path)
+        //     .if_match(etag)
+        //     .body(ByteStream::from_path(&download.path).await?);
+        //
+        // match request.send().await {
+        //     Ok(_) => Ok(()),
+        //     Err(e) if is_precondition_failed(&e) => {
+        //         Err(CatalogError::ConflictError(format!(
+        //             "Catalog was modified by another process (expected ETag: {})",
+        //             etag
+        //         )))
         //     }
+        //     Err(e) => Err(e.into()),
         // }
+        let _ = download; // Silence unused warning
         Err(CatalogError::Other(
             "S3 backend not implemented; enable s3 feature and add upload logic".to_string(),
         ))
