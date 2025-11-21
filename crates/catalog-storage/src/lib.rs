@@ -9,6 +9,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(any(feature = "gcs", feature = "s3"))]
+use std::sync::OnceLock;
+#[cfg(any(feature = "gcs", feature = "s3"))]
 use tempfile::NamedTempFile;
 
 // Cache module for cloud backends
@@ -22,7 +24,10 @@ pub type DynCatalogBackend = dyn CatalogBackend;
 
 /// Versioning metadata for optimistic concurrency checks on object storage.
 #[derive(Debug, Clone)]
-#[cfg_attr(any(feature = "gcs", feature = "s3"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    any(feature = "gcs", feature = "s3"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct ObjectVersion {
     /// Generation (GCS) or similar monotonic version identifier.
     pub generation: Option<String>,
@@ -39,6 +44,19 @@ pub struct CatalogDownload {
     pub catalog_version: i64,
     /// Optional remote version metadata (generation/ETag) for cloud backends
     pub remote_version: Option<ObjectVersion>,
+}
+
+/// Shared Tokio runtime for blocking cloud client calls from sync trait methods.
+/// Avoids spawning a new runtime per call and keeps API/CLI from creating nested runtimes.
+#[cfg(any(feature = "gcs", feature = "s3"))]
+fn tokio_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to build Tokio runtime")
+    })
 }
 
 /// Backend abstraction for catalog storage
@@ -172,7 +190,7 @@ pub fn backend_from_uri(uri: &str) -> Result<Box<dyn CatalogBackend>> {
         CatalogLocation::Gcs { bucket, object } => {
             #[cfg(feature = "gcs")]
             {
-                Ok(Box::new(GcsBackend::new(bucket, object)))
+                Ok(Box::new(GcsBackend::new(bucket, object)?))
             }
             #[cfg(not(feature = "gcs"))]
             {
@@ -193,7 +211,7 @@ pub fn backend_from_uri(uri: &str) -> Result<Box<dyn CatalogBackend>> {
                     bucket,
                     key,
                     region.unwrap_or_default(),
-                )))
+                )?))
             }
             #[cfg(not(feature = "s3"))]
             {
@@ -342,7 +360,7 @@ impl GcsBackend {
     ///
     /// let backend = GcsBackend::new("my-bucket", "catalogs/prod.db");
     /// ```
-    pub fn new(bucket: impl Into<String>, object: impl Into<String>) -> Self {
+    pub fn new(bucket: impl Into<String>, object: impl Into<String>) -> Result<Self> {
         use object_store::gcp::GoogleCloudStorageBuilder;
 
         let bucket = bucket.into();
@@ -352,36 +370,24 @@ impl GcsBackend {
         let store = GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(&bucket)
             .build()
-            .expect("Failed to create GCS client. Check GOOGLE_APPLICATION_CREDENTIALS.");
+            .map_err(|e| {
+                CatalogError::Other(format!(
+                    "Failed to create GCS client. Check GOOGLE_APPLICATION_CREDENTIALS: {}",
+                    e
+                ))
+            })?;
 
         // Initialize cache (optional based on env config)
-        let cache = CatalogCache::from_env()
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to initialize cache, proceeding without caching");
-                None
-            });
+        let cache = CatalogCache::from_env().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to initialize cache, proceeding without caching");
+            None
+        });
 
-        Self {
+        Ok(Self {
             store: std::sync::Arc::new(store),
             object_path: object_store::path::Path::from(object_path),
             cache,
-        }
-    }
-}
-
-#[cfg(not(feature = "gcs"))]
-pub struct GcsBackend {
-    bucket: String,
-    path: String,
-}
-
-#[cfg(not(feature = "gcs"))]
-impl GcsBackend {
-    pub fn new(bucket: impl Into<String>, path: impl Into<String>) -> Self {
-        Self {
-            bucket: bucket.into(),
-            path: path.into(),
-        }
+        })
     }
 }
 
@@ -397,26 +403,26 @@ impl CatalogBackend for GcsBackend {
             }
         }
 
-        // Use tokio runtime for async operations
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
+        // Use shared tokio runtime for async operations
+        tokio_runtime().block_on(async {
             // Download object from GCS
-            let get_result = self.store.get(&self.object_path).await.map_err(|e| match e {
-                object_store::Error::NotFound { .. } => CatalogError::Other(format!(
-                    "Catalog not found at gs://{} (run 'metafuse init' first)",
-                    self.object_path
-                )),
-                _ => CatalogError::Other(format!("Failed to download from GCS: {}", e)),
-            })?;
+            let get_result = self
+                .store
+                .get(&self.object_path)
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::NotFound { .. } => CatalogError::Other(format!(
+                        "Catalog not found at gs://{} (run 'metafuse init' first)",
+                        self.object_path
+                    )),
+                    _ => CatalogError::Other(format!("Failed to download from GCS: {}", e)),
+                })?;
 
             // Extract generation number from metadata (GCS-specific)
-            let generation = get_result
-                .meta
-                .version
-                .clone()
-                .ok_or_else(|| CatalogError::Other("Missing generation in GCS metadata".into()))?;
+            let generation =
+                get_result.meta.version.clone().ok_or_else(|| {
+                    CatalogError::Other("Missing generation in GCS metadata".into())
+                })?;
 
             tracing::debug!(
                 object = %self.object_path,
@@ -433,9 +439,8 @@ impl CatalogBackend for GcsBackend {
                 CatalogError::Other(format!("Failed to read GCS object data: {}", e))
             })?;
 
-            std::fs::write(temp_file.path(), &data).map_err(|e| {
-                CatalogError::Other(format!("Failed to write temp file: {}", e))
-            })?;
+            std::fs::write(temp_file.path(), &data)
+                .map_err(|e| CatalogError::Other(format!("Failed to write temp file: {}", e)))?;
 
             // Open connection to read catalog version
             let conn = Connection::open(temp_file.path())?;
@@ -470,67 +475,91 @@ impl CatalogBackend for GcsBackend {
         use object_store::{PutMode, PutOptions, PutPayload};
 
         // Validate remote version exists
-        let remote_version = download.remote_version.as_ref().ok_or_else(|| {
-            CatalogError::Other("Missing remote version for GCS upload".into())
-        })?;
+        let remote_version = download
+            .remote_version
+            .as_ref()
+            .ok_or_else(|| CatalogError::Other("Missing remote version for GCS upload".into()))?;
 
-        let generation = remote_version.generation.as_ref().ok_or_else(|| {
-            CatalogError::Other("Missing generation for GCS upload".into())
-        })?;
+        let generation = remote_version
+            .generation
+            .as_ref()
+            .ok_or_else(|| CatalogError::Other("Missing generation for GCS upload".into()))?;
 
-        // Read catalog file data
+        // Read catalog file data once; clone bytes cheaply across retries
         let data = std::fs::read(&download.path)
             .map_err(|e| CatalogError::Other(format!("Failed to read catalog file: {}", e)))?;
+        let data = bytes::Bytes::from(data);
 
-        // Use tokio runtime for async upload
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+        const MAX_RETRIES: u32 = 3;
+        const BASE_DELAY_MS: u64 = 100;
+        let uri = format!("gs://{}", self.object_path);
 
-        runtime.block_on(async {
-            // Upload with generation-based precondition (optimistic locking)
-            // Note: object_store 0.12.4 doesn't expose direct generation/etag matching
-            // We use the version string to create an UpdateVersion
-            use object_store::UpdateVersion;
+        for attempt in 0..=MAX_RETRIES {
+            let result = tokio_runtime().block_on(async {
+                // Upload with generation-based precondition (optimistic locking)
+                // Note: object_store 0.12.4 doesn't expose direct generation/etag matching
+                use object_store::UpdateVersion;
 
-            let update_version = UpdateVersion {
-                e_tag: None,
-                version: Some(generation.clone()),
-            };
+                let update_version = UpdateVersion {
+                    e_tag: None,
+                    version: Some(generation.clone()),
+                };
 
-            let put_opts = PutOptions {
-                mode: PutMode::Update(update_version),
-                ..Default::default()
-            };
+                let put_opts = PutOptions {
+                    mode: PutMode::Update(update_version),
+                    ..Default::default()
+                };
 
-            self.store
-                .put_opts(&self.object_path, PutPayload::from(data), put_opts)
+                self.store.put_opts(
+                    &self.object_path,
+                    PutPayload::from(data.clone()),
+                    put_opts,
+                )
                 .await
-                .map_err(|e| match e {
-                    object_store::Error::Precondition { .. } => CatalogError::ConflictError(
+            });
+
+            match result {
+                Ok(_) => {
+                    tracing::info!(
+                        object = %self.object_path,
+                        generation = %generation,
+                        "Uploaded catalog to GCS"
+                    );
+                    if let Some(ref cache) = self.cache {
+                        if let Err(e) = cache.invalidate(&uri) {
+                            tracing::warn!(error = %e, "Failed to invalidate cache");
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(object_store::Error::Precondition { .. }) => {
+                    if let Some(ref cache) = self.cache {
+                        let _ = cache.invalidate(&uri);
+                    }
+                    if attempt < MAX_RETRIES {
+                        let delay = BASE_DELAY_MS * 2u64.saturating_pow(attempt);
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        continue;
+                    }
+                    return Err(CatalogError::ConflictError(
                         format!(
                             "Catalog was modified by another process (expected generation: {}). Retry your operation.",
                             generation
                         ),
-                    ),
-                    _ => CatalogError::Other(format!("Failed to upload to GCS: {}", e)),
-                })?;
-
-            tracing::info!(
-                object = %self.object_path,
-                generation = %generation,
-                "Uploaded catalog to GCS"
-            );
-
-            // Invalidate cache after successful upload
-            let uri = format!("gs://{}", self.object_path);
-            if let Some(ref cache) = self.cache {
-                if let Err(e) = cache.invalidate(&uri) {
-                    tracing::warn!(error = %e, "Failed to invalidate cache");
+                    ));
+                }
+                Err(e) => {
+                    return Err(CatalogError::Other(format!(
+                        "Failed to upload to GCS: {}",
+                        e
+                    )));
                 }
             }
+        }
 
-            Ok(())
-        })
+        Err(CatalogError::ConflictError(
+            "Exceeded retry attempts for GCS upload".into(),
+        ))
     }
 
     fn get_connection(&self) -> Result<Connection> {
@@ -542,15 +571,15 @@ impl CatalogBackend for GcsBackend {
     }
 
     fn exists(&self) -> Result<bool> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
+        tokio_runtime().block_on(async {
             // Check if object exists using HEAD request
             match self.store.head(&self.object_path).await {
                 Ok(_) => Ok(true),
                 Err(object_store::Error::NotFound { .. }) => Ok(false),
-                Err(e) => Err(CatalogError::Other(format!("Failed to check GCS object: {}", e))),
+                Err(e) => Err(CatalogError::Other(format!(
+                    "Failed to check GCS object: {}",
+                    e
+                ))),
             }
         })
     }
@@ -576,16 +605,15 @@ impl CatalogBackend for GcsBackend {
         let data = std::fs::read(temp_file.path())
             .map_err(|e| CatalogError::Other(format!("Failed to read temp file: {}", e)))?;
 
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
+        tokio_runtime().block_on(async {
             use object_store::PutPayload;
 
             self.store
                 .put(&self.object_path, PutPayload::from(data))
                 .await
-                .map_err(|e| CatalogError::Other(format!("Failed to upload initial catalog: {}", e)))?;
+                .map_err(|e| {
+                    CatalogError::Other(format!("Failed to upload initial catalog: {}", e))
+                })?;
 
             tracing::info!(
                 object = %self.object_path,
@@ -598,32 +626,11 @@ impl CatalogBackend for GcsBackend {
 }
 
 #[cfg(not(feature = "gcs"))]
-impl CatalogBackend for GcsBackend {
-    fn download(&self) -> Result<CatalogDownload> {
-        Err(CatalogError::Other(
-            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
-        ))
-    }
+pub struct GcsBackend;
 
-    fn upload(&self, _download: &CatalogDownload) -> Result<()> {
-        Err(CatalogError::Other(
-            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
-        ))
-    }
-
-    fn get_connection(&self) -> Result<Connection> {
-        Err(CatalogError::Other(
-            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
-        ))
-    }
-
-    fn exists(&self) -> Result<bool> {
-        Err(CatalogError::Other(
-            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
-        ))
-    }
-
-    fn initialize(&self) -> Result<()> {
+#[cfg(not(feature = "gcs"))]
+impl GcsBackend {
+    pub fn new(_bucket: impl Into<String>, _object: impl Into<String>) -> Result<Self> {
         Err(CatalogError::Other(
             "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
         ))
@@ -686,7 +693,7 @@ impl S3Backend {
         bucket: impl Into<String>,
         key: impl Into<String>,
         region: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         use object_store::aws::AmazonS3Builder;
 
         let bucket = bucket.into();
@@ -700,44 +707,24 @@ impl S3Backend {
             builder = builder.with_region(&region);
         }
 
-        let store = builder
-            .build()
-            .expect("Failed to create S3 client. Check AWS credentials.");
+        let store = builder.build().map_err(|e| {
+            CatalogError::Other(format!(
+                "Failed to create S3 client. Check AWS credentials/region: {}",
+                e
+            ))
+        })?;
 
         // Initialize cache (optional based on env config)
-        let cache = CatalogCache::from_env()
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Failed to initialize cache, proceeding without caching");
-                None
-            });
+        let cache = CatalogCache::from_env().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to initialize cache, proceeding without caching");
+            None
+        });
 
-        Self {
+        Ok(Self {
             store: std::sync::Arc::new(store),
             object_path: object_store::path::Path::from(object_path),
             cache,
-        }
-    }
-}
-
-#[cfg(not(feature = "s3"))]
-pub struct S3Backend {
-    bucket: String,
-    path: String,
-    region: String,
-}
-
-#[cfg(not(feature = "s3"))]
-impl S3Backend {
-    pub fn new(
-        bucket: impl Into<String>,
-        path: impl Into<String>,
-        region: impl Into<String>,
-    ) -> Self {
-        Self {
-            bucket: bucket.into(),
-            path: path.into(),
-            region: region.into(),
-        }
+        })
     }
 }
 
@@ -753,19 +740,20 @@ impl CatalogBackend for S3Backend {
             }
         }
 
-        // Use tokio runtime for async operations
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
+        // Use shared tokio runtime for async operations
+        tokio_runtime().block_on(async {
             // Download object from S3
-            let get_result = self.store.get(&self.object_path).await.map_err(|e| match e {
-                object_store::Error::NotFound { .. } => CatalogError::Other(format!(
-                    "Catalog not found at s3://{} (run 'metafuse init' first)",
-                    self.object_path
-                )),
-                _ => CatalogError::Other(format!("Failed to download from S3: {}", e)),
-            })?;
+            let get_result = self
+                .store
+                .get(&self.object_path)
+                .await
+                .map_err(|e| match e {
+                    object_store::Error::NotFound { .. } => CatalogError::Other(format!(
+                        "Catalog not found at s3://{} (run 'metafuse init' first)",
+                        self.object_path
+                    )),
+                    _ => CatalogError::Other(format!("Failed to download from S3: {}", e)),
+                })?;
 
             // Extract ETag from metadata (S3-specific)
             let etag = get_result
@@ -789,9 +777,8 @@ impl CatalogBackend for S3Backend {
                 CatalogError::Other(format!("Failed to read S3 object data: {}", e))
             })?;
 
-            std::fs::write(temp_file.path(), &data).map_err(|e| {
-                CatalogError::Other(format!("Failed to write temp file: {}", e))
-            })?;
+            std::fs::write(temp_file.path(), &data)
+                .map_err(|e| CatalogError::Other(format!("Failed to write temp file: {}", e)))?;
 
             // Open connection to read catalog version
             let conn = Connection::open(temp_file.path())?;
@@ -826,65 +813,90 @@ impl CatalogBackend for S3Backend {
         use object_store::{PutMode, PutOptions, PutPayload};
 
         // Validate remote version exists
-        let remote_version = download.remote_version.as_ref().ok_or_else(|| {
-            CatalogError::Other("Missing remote version for S3 upload".into())
-        })?;
+        let remote_version = download
+            .remote_version
+            .as_ref()
+            .ok_or_else(|| CatalogError::Other("Missing remote version for S3 upload".into()))?;
 
-        let etag = remote_version.etag.as_ref().ok_or_else(|| {
-            CatalogError::Other("Missing ETag for S3 upload".into())
-        })?;
+        let etag = remote_version
+            .etag
+            .as_ref()
+            .ok_or_else(|| CatalogError::Other("Missing ETag for S3 upload".into()))?;
 
-        // Read catalog file data
+        // Read catalog file data once; clone bytes cheaply across retries
         let data = std::fs::read(&download.path)
             .map_err(|e| CatalogError::Other(format!("Failed to read catalog file: {}", e)))?;
+        let data = bytes::Bytes::from(data);
 
-        // Use tokio runtime for async upload
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
+        const MAX_RETRIES: u32 = 3;
+        const BASE_DELAY_MS: u64 = 100;
+        let uri = format!("s3://{}", self.object_path);
 
-        runtime.block_on(async {
-            // Upload with ETag-based precondition (optimistic locking)
-            use object_store::UpdateVersion;
+        for attempt in 0..=MAX_RETRIES {
+            let result = tokio_runtime().block_on(async {
+                // Upload with ETag-based precondition (optimistic locking)
+                use object_store::UpdateVersion;
 
-            let update_version = UpdateVersion {
-                e_tag: Some(etag.clone()),
-                version: None,
-            };
+                let update_version = UpdateVersion {
+                    e_tag: Some(etag.clone()),
+                    version: None,
+                };
 
-            let put_opts = PutOptions {
-                mode: PutMode::Update(update_version),
-                ..Default::default()
-            };
+                let put_opts = PutOptions {
+                    mode: PutMode::Update(update_version),
+                    ..Default::default()
+                };
 
-            self.store
-                .put_opts(&self.object_path, PutPayload::from(data), put_opts)
+                self.store.put_opts(
+                    &self.object_path,
+                    PutPayload::from(data.clone()),
+                    put_opts,
+                )
                 .await
-                .map_err(|e| match e {
-                    object_store::Error::Precondition { .. } => CatalogError::ConflictError(
+            });
+
+            match result {
+                Ok(_) => {
+                    tracing::info!(
+                        object = %self.object_path,
+                        etag = %etag,
+                        "Uploaded catalog to S3"
+                    );
+                    if let Some(ref cache) = self.cache {
+                        if let Err(e) = cache.invalidate(&uri) {
+                            tracing::warn!(error = %e, "Failed to invalidate cache");
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(object_store::Error::Precondition { .. }) => {
+                    if let Some(ref cache) = self.cache {
+                        let _ = cache.invalidate(&uri);
+                    }
+                    if attempt < MAX_RETRIES {
+                        let delay = BASE_DELAY_MS * 2u64.saturating_pow(attempt);
+                        std::thread::sleep(std::time::Duration::from_millis(delay));
+                        continue;
+                    }
+                    return Err(CatalogError::ConflictError(
                         format!(
                             "Catalog was modified by another process (expected ETag: {}). Retry your operation.",
                             etag
                         ),
-                    ),
-                    _ => CatalogError::Other(format!("Failed to upload to S3: {}", e)),
-                })?;
-
-            tracing::info!(
-                object = %self.object_path,
-                etag = %etag,
-                "Uploaded catalog to S3"
-            );
-
-            // Invalidate cache after successful upload
-            let uri = format!("s3://{}", self.object_path);
-            if let Some(ref cache) = self.cache {
-                if let Err(e) = cache.invalidate(&uri) {
-                    tracing::warn!(error = %e, "Failed to invalidate cache");
+                    ));
+                }
+                Err(e) => {
+                    return Err(CatalogError::Other(format!(
+                        "Failed to upload to S3: {}",
+                        e
+                    )));
                 }
             }
+        }
 
-            Ok(())
-        })
+        Err(CatalogError::ConflictError(
+            "Exceeded retry attempts for S3 upload".into(),
+        ))
     }
 
     fn get_connection(&self) -> Result<Connection> {
@@ -896,15 +908,15 @@ impl CatalogBackend for S3Backend {
     }
 
     fn exists(&self) -> Result<bool> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
+        tokio_runtime().block_on(async {
             // Check if object exists using HEAD request
             match self.store.head(&self.object_path).await {
                 Ok(_) => Ok(true),
                 Err(object_store::Error::NotFound { .. }) => Ok(false),
-                Err(e) => Err(CatalogError::Other(format!("Failed to check S3 object: {}", e))),
+                Err(e) => Err(CatalogError::Other(format!(
+                    "Failed to check S3 object: {}",
+                    e
+                ))),
             }
         })
     }
@@ -930,16 +942,15 @@ impl CatalogBackend for S3Backend {
         let data = std::fs::read(temp_file.path())
             .map_err(|e| CatalogError::Other(format!("Failed to read temp file: {}", e)))?;
 
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| CatalogError::Other(format!("Failed to create tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
+        tokio_runtime().block_on(async {
             use object_store::PutPayload;
 
             self.store
                 .put(&self.object_path, PutPayload::from(data))
                 .await
-                .map_err(|e| CatalogError::Other(format!("Failed to upload initial catalog: {}", e)))?;
+                .map_err(|e| {
+                    CatalogError::Other(format!("Failed to upload initial catalog: {}", e))
+                })?;
 
             tracing::info!(
                 object = %self.object_path,
@@ -952,32 +963,15 @@ impl CatalogBackend for S3Backend {
 }
 
 #[cfg(not(feature = "s3"))]
-impl CatalogBackend for S3Backend {
-    fn download(&self) -> Result<CatalogDownload> {
-        Err(CatalogError::Other(
-            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
-        ))
-    }
+pub struct S3Backend;
 
-    fn upload(&self, _download: &CatalogDownload) -> Result<()> {
-        Err(CatalogError::Other(
-            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
-        ))
-    }
-
-    fn get_connection(&self) -> Result<Connection> {
-        Err(CatalogError::Other(
-            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
-        ))
-    }
-
-    fn exists(&self) -> Result<bool> {
-        Err(CatalogError::Other(
-            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
-        ))
-    }
-
-    fn initialize(&self) -> Result<()> {
+#[cfg(not(feature = "s3"))]
+impl S3Backend {
+    pub fn new(
+        _bucket: impl Into<String>,
+        _path: impl Into<String>,
+        _region: impl Into<String>,
+    ) -> Result<Self> {
         Err(CatalogError::Other(
             "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
         ))
