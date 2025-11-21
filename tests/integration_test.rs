@@ -508,11 +508,7 @@ fn test_partition_keys() {
             Some(OperationalMeta {
                 row_count: Some(1_000_000),
                 size_bytes: Some(500_000_000),
-                partition_keys: vec![
-                    "year".to_string(),
-                    "month".to_string(),
-                    "day".to_string(),
-                ],
+                partition_keys: vec!["year".to_string(), "month".to_string(), "day".to_string()],
             }),
             vec![],
             vec![],
@@ -673,7 +669,6 @@ fn test_operational_metadata() {
     assert_eq!(row_count, Some(5_000_000));
     assert_eq!(size_bytes, Some(2_500_000_000));
 
-    let partition_keys: Vec<String> =
-        serde_json::from_str(&partition_keys_json.unwrap()).unwrap();
+    let partition_keys: Vec<String> = serde_json::from_str(&partition_keys_json.unwrap()).unwrap();
     assert_eq!(partition_keys, vec!["region", "date"]);
 }

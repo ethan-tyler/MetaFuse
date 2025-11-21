@@ -155,12 +155,34 @@ pub fn parse_catalog_uri(uri: &str) -> Result<CatalogLocation> {
 pub fn backend_from_uri(uri: &str) -> Result<Box<dyn CatalogBackend>> {
     match parse_catalog_uri(uri)? {
         CatalogLocation::Local(path) => Ok(Box::new(LocalSqliteBackend::new(path))),
-        CatalogLocation::Gcs { .. } => Err(CatalogError::Other(
-            "GCS backend not implemented; enable gcs feature and add implementation".into(),
-        )),
-        CatalogLocation::S3 { .. } => Err(CatalogError::Other(
-            "S3 backend not implemented; enable s3 feature and add implementation".into(),
-        )),
+        CatalogLocation::Gcs { bucket, object } => {
+            #[cfg(feature = "gcs")]
+            {
+                Ok(Box::new(GcsBackend::new(bucket, object)))
+            }
+            #[cfg(not(feature = "gcs"))]
+            {
+                Err(CatalogError::Other(
+                    "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".into(),
+                ))
+            }
+        }
+        CatalogLocation::S3 {
+            bucket,
+            key,
+            region,
+        } => {
+            #[cfg(feature = "s3")]
+            {
+                Ok(Box::new(S3Backend::new(bucket, key, region.unwrap_or_default())))
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                Err(CatalogError::Other(
+                    "S3 backend requires the 's3' feature. Rebuild with --features s3".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -289,6 +311,7 @@ impl GcsBackend {
     }
 }
 
+#[cfg(feature = "gcs")]
 impl CatalogBackend for GcsBackend {
     fn download(&self) -> Result<CatalogDownload> {
         let _file = NamedTempFile::new().map_err(|e| {
@@ -369,6 +392,39 @@ impl CatalogBackend for GcsBackend {
     }
 }
 
+#[cfg(not(feature = "gcs"))]
+impl CatalogBackend for GcsBackend {
+    fn download(&self) -> Result<CatalogDownload> {
+        Err(CatalogError::Other(
+            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
+        ))
+    }
+
+    fn upload(&self, _download: &CatalogDownload) -> Result<()> {
+        Err(CatalogError::Other(
+            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
+        ))
+    }
+
+    fn get_connection(&self) -> Result<Connection> {
+        Err(CatalogError::Other(
+            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
+        ))
+    }
+
+    fn exists(&self) -> Result<bool> {
+        Err(CatalogError::Other(
+            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
+        ))
+    }
+
+    fn initialize(&self) -> Result<()> {
+        Err(CatalogError::Other(
+            "GCS backend requires the 'gcs' feature. Rebuild with --features gcs".to_string(),
+        ))
+    }
+}
+
 /// S3 backend for catalog storage (future implementation)
 ///
 /// Similar to GCS backend but using AWS S3.
@@ -403,6 +459,7 @@ impl S3Backend {
     }
 }
 
+#[cfg(feature = "s3")]
 impl CatalogBackend for S3Backend {
     fn download(&self) -> Result<CatalogDownload> {
         let _file = NamedTempFile::new().map_err(|e| {
@@ -476,6 +533,39 @@ impl CatalogBackend for S3Backend {
     fn initialize(&self) -> Result<()> {
         Err(CatalogError::Other(
             "S3 backend not implemented; enable s3 feature and add initialize logic".to_string(),
+        ))
+    }
+}
+
+#[cfg(not(feature = "s3"))]
+impl CatalogBackend for S3Backend {
+    fn download(&self) -> Result<CatalogDownload> {
+        Err(CatalogError::Other(
+            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
+        ))
+    }
+
+    fn upload(&self, _download: &CatalogDownload) -> Result<()> {
+        Err(CatalogError::Other(
+            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
+        ))
+    }
+
+    fn get_connection(&self) -> Result<Connection> {
+        Err(CatalogError::Other(
+            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
+        ))
+    }
+
+    fn exists(&self) -> Result<bool> {
+        Err(CatalogError::Other(
+            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
+        ))
+    }
+
+    fn initialize(&self) -> Result<()> {
+        Err(CatalogError::Other(
+            "S3 backend requires the 's3' feature. Rebuild with --features s3".to_string(),
         ))
     }
 }
