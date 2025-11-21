@@ -14,6 +14,8 @@
 //! - **TTL expiration**: Cache entries older than TTL are considered stale
 //! - **Write invalidation**: Cache is cleared after uploads to ensure consistency
 //! - **Conflict invalidation**: Cache is cleared when optimistic concurrency conflicts occur
+//! - **Staleness trade-off**: Cache hits trust TTL without remote HEAD revalidation to avoid extra
+//!   cloud calls; keep TTL small for higher freshness.
 
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use crate::{CatalogDownload, ObjectVersion, Result};
@@ -63,9 +65,8 @@ impl CatalogCache {
         }
 
         let base_dir = Self::cache_dir()?;
-        std::fs::create_dir_all(&base_dir).map_err(|e| {
-            CatalogError::Other(format!("Failed to create cache directory: {}", e))
-        })?;
+        std::fs::create_dir_all(&base_dir)
+            .map_err(|e| CatalogError::Other(format!("Failed to create cache directory: {}", e)))?;
 
         tracing::debug!(
             path = %base_dir.display(),
@@ -137,11 +138,7 @@ impl CatalogCache {
         let conn = rusqlite::Connection::open(&cache_key)?;
         let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
 
-        tracing::debug!(
-            uri = uri,
-            age_secs = age.as_secs(),
-            "Cache hit"
-        );
+        tracing::debug!(uri = uri, age_secs = age.as_secs(), "Cache hit");
 
         Ok(Some(CatalogDownload {
             path: cache_key,
@@ -164,9 +161,8 @@ impl CatalogCache {
         let meta_path = self.meta_path(uri);
 
         // Copy catalog file to cache
-        std::fs::copy(&download.path, &cache_key).map_err(|e| {
-            CatalogError::Other(format!("Failed to copy catalog to cache: {}", e))
-        })?;
+        std::fs::copy(&download.path, &cache_key)
+            .map_err(|e| CatalogError::Other(format!("Failed to copy catalog to cache: {}", e)))?;
 
         // Write version metadata
         if let Some(ref remote_version) = download.remote_version {
@@ -225,14 +221,14 @@ impl CatalogCache {
 #[cfg(any(feature = "gcs", feature = "s3"))]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use std::sync::Mutex;
+
+    // Shared lock to serialize all cache tests that modify environment variables
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_cache_disabled_with_zero_ttl() {
-        // Use a lock to serialize environment variable tests
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "0");
         let cache = CatalogCache::from_env().unwrap();
@@ -242,10 +238,7 @@ mod tests {
 
     #[test]
     fn test_cache_enabled_with_nonzero_ttl() {
-        // Use a lock to serialize environment variable tests
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
         let cache = CatalogCache::from_env().unwrap();
@@ -255,10 +248,7 @@ mod tests {
 
     #[test]
     fn test_cache_miss_nonexistent_uri() {
-        // Use a lock to serialize environment variable tests
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
         let cache = CatalogCache::from_env().unwrap().unwrap();
@@ -269,10 +259,7 @@ mod tests {
 
     #[test]
     fn test_hash_uri_consistency() {
-        // Use a lock to serialize environment variable tests
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
         let cache = CatalogCache::from_env().unwrap().unwrap();
@@ -287,10 +274,7 @@ mod tests {
 
     #[test]
     fn test_invalidate_cache() {
-        // Use a lock to serialize environment variable tests
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
 
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "60");
         let cache = CatalogCache::from_env().unwrap().unwrap();

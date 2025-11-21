@@ -197,6 +197,11 @@ See [examples/README.md](examples/README.md) for detailed walkthrough and expect
 - **[Getting Started](docs/getting-started.md)** - 10-minute tutorial
 - **[Architecture](docs/architecture.md)** - How MetaFuse works
 - **[API Reference](docs/api-reference.md)** - REST API endpoints
+- **[Deployment (GCP)](docs/deployment-gcp.md)** - Cloud Run/GKE setup, auth, cost notes
+- **[Deployment (AWS)](docs/deployment-aws.md)** - ECS/EKS/Lambda setup, auth, cost notes
+- **[Authentication](docs/auth-gcp.md)** / **[auth-aws.md](docs/auth-aws.md)** - Credential patterns and best practices
+- **[Migration: Local → Cloud](docs/migration-local-to-cloud.md)** - Step-by-step move to object storage
+- **[Troubleshooting](docs/troubleshooting.md)** - Common issues and fixes
 - **[Roadmap](docs/roadmap.md)** - What's coming next
 
 ## Project Structure
