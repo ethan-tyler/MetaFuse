@@ -325,7 +325,7 @@ impl<B: CatalogBackend> Emitter<B> {
         // No manual dataset_search insert/delete needed here.
 
         // Increment catalog version for optimistic concurrency control
-        increment_catalog_version(&tx)?;
+        increment_catalog_version(tx)?;
 
         Ok(())
     }
