@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
         }),
         vec![], // No upstream dependencies
         vec!["example".to_string(), "tutorial".to_string()],
-    )?;
+    ).await?;
 
     println!("   Metadata emitted: sample_dataset");
 

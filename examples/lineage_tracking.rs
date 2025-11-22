@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
         }),
         vec![], // No upstream dependencies
         vec!["raw".to_string(), "transactions".to_string()],
-    )?;
+    ).await?;
     println!("  Metadata emitted: raw_transactions\n");
 
     // ========== STAGE 2: Data Cleaning ==========
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
         }),
         vec!["raw_transactions".to_string()], // Upstream dependency
         vec!["cleaned".to_string(), "validated".to_string()],
-    )?;
+    ).await?;
     println!("  Metadata emitted: cleaned_transactions");
     println!("  Lineage: raw_transactions -> cleaned_transactions\n");
 
@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
             "summary".to_string(),
             "daily".to_string(),
         ],
-    )?;
+    ).await?;
     println!("  Metadata emitted: daily_summary");
     println!("  Lineage: cleaned_transactions -> daily_summary\n");
 
