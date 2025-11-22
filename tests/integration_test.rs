@@ -14,12 +14,12 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Helper function to create a test backend with isolated storage
-fn create_test_backend() -> (TempDir, LocalSqliteBackend) {
+async fn create_test_backend() -> (TempDir, LocalSqliteBackend) {
     let temp_dir = TempDir::new().unwrap();
     let catalog_path = temp_dir.path().join("test_catalog.db");
     let backend = LocalSqliteBackend::new(&catalog_path);
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     init_sqlite_schema(&conn).unwrap();
     drop(conn);
 
@@ -34,10 +34,9 @@ fn create_sample_schema() -> Arc<Schema> {
         Field::new("value", DataType::Float64, true),
     ]))
 }
-
-#[test]
-fn test_emit_and_query_dataset() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_emit_and_query_dataset() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -59,11 +58,10 @@ fn test_emit_and_query_dataset() {
             }),
             vec![],
             vec!["test".to_string()],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     // Query the dataset
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let mut stmt = conn
         .prepare(
             "SELECT name, path, format, description, tenant, domain, owner, row_count \
@@ -105,10 +103,9 @@ fn test_emit_and_query_dataset() {
     assert_eq!(owner, Some("test@example.com".to_string()));
     assert_eq!(row_count, Some(100));
 }
-
-#[test]
-fn test_lineage_tracking() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_lineage_tracking() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -125,8 +122,7 @@ fn test_lineage_tracking() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     emitter
         .emit_dataset(
@@ -141,10 +137,9 @@ fn test_lineage_tracking() {
             None,
             vec!["parent_dataset".to_string()],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let lineage_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM lineage l \
@@ -158,10 +153,9 @@ fn test_lineage_tracking() {
 
     assert_eq!(lineage_count, 1);
 }
-
-#[test]
-fn test_multi_tenant_isolation() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_multi_tenant_isolation() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -178,8 +172,7 @@ fn test_multi_tenant_isolation() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     emitter
         .emit_dataset(
@@ -194,10 +187,9 @@ fn test_multi_tenant_isolation() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let count_a: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM datasets WHERE tenant = 'tenant_a'",
@@ -216,10 +208,9 @@ fn test_multi_tenant_isolation() {
     assert_eq!(count_a, 1);
     assert_eq!(count_b, 1);
 }
-
-#[test]
-fn test_upsert_dataset() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_upsert_dataset() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -240,8 +231,7 @@ fn test_upsert_dataset() {
             }),
             vec![],
             vec!["v1".to_string()],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     emitter
         .emit_dataset(
@@ -260,10 +250,9 @@ fn test_upsert_dataset() {
             }),
             vec![],
             vec!["v2".to_string()],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let (path, description, row_count): (String, Option<String>, Option<i64>) = conn
         .query_row(
             "SELECT path, description, row_count FROM datasets WHERE name = 'upsert_dataset'",
@@ -276,10 +265,9 @@ fn test_upsert_dataset() {
     assert_eq!(description, Some("Version 2".to_string()));
     assert_eq!(row_count, Some(200));
 }
-
-#[test]
-fn test_tags() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_tags() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -300,10 +288,9 @@ fn test_tags() {
                 "important".to_string(),
                 "daily".to_string(),
             ],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let mut stmt = conn
         .prepare(
             "SELECT tag FROM tags t \
@@ -321,10 +308,9 @@ fn test_tags() {
 
     assert_eq!(tags, vec!["daily", "important", "prod"]);
 }
-
-#[test]
-fn test_schema_fields() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_schema_fields() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -341,10 +327,9 @@ fn test_schema_fields() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let mut stmt = conn
         .prepare(
             "SELECT f.name, f.data_type, f.nullable \
@@ -371,10 +356,9 @@ fn test_schema_fields() {
         ("value".to_string(), "Float64".to_string(), true)
     );
 }
-
-#[test]
-fn test_idempotent_emission() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_idempotent_emission() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -396,11 +380,10 @@ fn test_idempotent_emission() {
                 }),
                 vec![],
                 vec!["test".to_string()],
-            )
-            .unwrap();
+            ).await.unwrap();
     }
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM datasets WHERE name = 'idempotent_dataset'",
@@ -411,10 +394,9 @@ fn test_idempotent_emission() {
 
     assert_eq!(count, 1);
 }
-
-#[test]
-fn test_fts_search() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_fts_search() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -432,8 +414,7 @@ fn test_fts_search() {
             None,
             vec![],
             vec!["daily".to_string(), "transactions".to_string()],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     emitter
         .emit_dataset(
@@ -448,10 +429,9 @@ fn test_fts_search() {
             None,
             vec![],
             vec!["users".to_string(), "profile".to_string()],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
 
     // Search for "transactions" should find the transactions dataset
     let mut stmt = conn
@@ -487,10 +467,9 @@ fn test_fts_search() {
 
     assert_eq!(results, vec!["transactions_daily"]);
 }
-
-#[test]
-fn test_partition_keys() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_partition_keys() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -512,10 +491,9 @@ fn test_partition_keys() {
             }),
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
 
     // Verify partition keys are stored as JSON
     let partition_keys_json: String = conn
@@ -533,10 +511,9 @@ fn test_partition_keys() {
         vec!["year".to_string(), "month".to_string(), "day".to_string()]
     );
 }
-
-#[test]
-fn test_domain_filtering() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_domain_filtering() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -554,8 +531,7 @@ fn test_domain_filtering() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     emitter
         .emit_dataset(
@@ -570,8 +546,7 @@ fn test_domain_filtering() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
     emitter
         .emit_dataset(
@@ -586,10 +561,9 @@ fn test_domain_filtering() {
             None,
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
 
     // Query datasets by domain
     let finance_count: i64 = conn
@@ -627,10 +601,9 @@ fn test_domain_filtering() {
         vec!["finance_dataset_1", "finance_dataset_2"]
     );
 }
-
-#[test]
-fn test_operational_metadata() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_operational_metadata() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
     let schema = create_sample_schema();
 
@@ -652,10 +625,9 @@ fn test_operational_metadata() {
             }),
             vec![],
             vec![],
-        )
-        .unwrap();
+        ).await.unwrap();
 
-    let conn = backend.get_connection().unwrap();
+    let conn = backend.get_connection().await.unwrap();
 
     // Verify all operational metadata fields
     let (row_count, size_bytes, partition_keys_json): (Option<i64>, Option<i64>, Option<String>) =
@@ -674,10 +646,9 @@ fn test_operational_metadata() {
 }
 
 // ===== Validation Error Tests =====
-
-#[test]
-fn test_validation_reject_invalid_dataset_name() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_validation_reject_invalid_dataset_name() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
@@ -694,10 +665,9 @@ fn test_validation_reject_invalid_dataset_name() {
         None,
         vec![],
         vec![],
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("invalid characters"));
 
@@ -714,10 +684,9 @@ fn test_validation_reject_invalid_dataset_name() {
         None,
         vec![],
         vec![],
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("cannot start or end with hyphen"));
 
@@ -734,14 +703,13 @@ fn test_validation_reject_invalid_dataset_name() {
         None,
         vec![],
         vec![],
-    );
+    ).await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("cannot be empty"));
 }
-
-#[test]
-fn test_validation_reject_invalid_tags() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_validation_reject_invalid_tags() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
@@ -758,10 +726,9 @@ fn test_validation_reject_invalid_tags() {
         None,
         vec![],
         vec!["invalid tag".to_string()], // Space not allowed
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("invalid characters"));
 
@@ -778,17 +745,15 @@ fn test_validation_reject_invalid_tags() {
         None,
         vec![],
         vec!["tag@value".to_string()], // @ not allowed
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("invalid characters"));
 }
-
-#[test]
-fn test_validation_reject_invalid_field_names() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_validation_reject_invalid_field_names() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
 
     // Create schema with invalid field name (contains hyphen)
@@ -809,17 +774,15 @@ fn test_validation_reject_invalid_field_names() {
         None,
         vec![],
         vec![],
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("invalid characters"));
 }
-
-#[test]
-fn test_validation_reject_invalid_tenant_domain() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_validation_reject_invalid_tenant_domain() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
@@ -836,10 +799,9 @@ fn test_validation_reject_invalid_tenant_domain() {
         None,
         vec![],
         vec![],
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("invalid characters"));
 
@@ -856,17 +818,15 @@ fn test_validation_reject_invalid_tenant_domain() {
         None,
         vec![],
         vec![],
-    );
+    ).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
+    assert!(result.unwrap_err()
         .to_string()
         .contains("invalid characters"));
 }
-
-#[test]
-fn test_validation_accept_valid_inputs() {
-    let (_temp_dir, backend) = create_test_backend();
+    #[tokio::test]
+async fn test_validation_accept_valid_inputs() {
+    let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
@@ -887,6 +847,6 @@ fn test_validation_accept_valid_inputs() {
         }),
         vec!["upstream_dataset".to_string()],
         vec!["env:prod".to_string(), "team-analytics".to_string()], // Valid tags with colon and hyphen
-    );
+    ).await;
     assert!(result.is_ok());
 }
