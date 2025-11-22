@@ -72,7 +72,7 @@ pub struct CatalogDownload {
 ///
 /// # Manual Async Trait
 ///
-/// This trait uses manual async implementation (Pin<Box<dyn Future>>)
+/// This trait uses manual async implementation (`Pin<Box<dyn Future>>`)
 /// instead of async-trait crate for zero-cost abstraction and explicit
 /// Send bounds.
 pub trait CatalogBackend: Send + Sync {
