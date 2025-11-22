@@ -126,8 +126,8 @@ mod tests {
             .output();
     }
 
-    #[test]
-    fn test_s3_initialize_catalog() {
+    #[tokio::test]
+    async fn test_s3_initialize_catalog() {
         let _guard = match test_guard("test_s3_initialize_catalog") {
             Some(g) => g,
             None => return,
@@ -136,10 +136,10 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize should succeed
-        assert!(backend.initialize().is_ok());
+        assert!(backend.initialize().await.is_ok());
 
         // Second initialize should fail (already exists)
-        assert!(matches!(backend.initialize(), Err(CatalogError::Other(_))));
+        assert!(matches!(backend.initialize().await, Err(CatalogError::Other(_))));
 
         // Cleanup
         std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -149,8 +149,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_exists_check() {
+    #[tokio::test]
+    async fn test_s3_exists_check() {
         let _guard = match test_guard("test_s3_exists_check") {
             Some(g) => g,
             None => return,
@@ -159,13 +159,13 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Should not exist initially
-        assert_eq!(backend.exists().unwrap(), false);
+        assert_eq!(backend.exists().await.unwrap(), false);
 
         // Initialize
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // Should exist now
-        assert_eq!(backend.exists().unwrap(), true);
+        assert_eq!(backend.exists().await.unwrap(), true);
 
         // Cleanup
         std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -175,8 +175,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_upload_download_roundtrip() {
+    #[tokio::test]
+    async fn test_s3_upload_download_roundtrip() {
         let _guard = match test_guard("test_s3_upload_download_roundtrip") {
             Some(g) => g,
             None => return,
@@ -185,10 +185,10 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // Download catalog
-        let download = backend.download().unwrap();
+        let download = backend.download().await.unwrap();
         assert!(download.path.exists());
         assert_eq!(download.catalog_version, 1);
         assert!(download.remote_version.is_some());
@@ -205,8 +205,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_not_found_handling() {
+    #[tokio::test]
+    async fn test_s3_not_found_handling() {
         let _guard = match test_guard("test_s3_not_found_handling") {
             Some(g) => g,
             None => return,
@@ -215,7 +215,7 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "nonexistent.db");
 
         // Download non-existent catalog should fail gracefully
-        let result = backend.download();
+        let result = backend.download().await;
         assert!(result.is_err());
 
         match result {
@@ -233,8 +233,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_get_connection() {
+    #[tokio::test]
+    async fn test_s3_get_connection() {
         let _guard = match test_guard("test_s3_get_connection") {
             Some(g) => g,
             None => return,
@@ -243,10 +243,10 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // Get connection should succeed
-        let conn = backend.get_connection().unwrap();
+        let conn = backend.get_connection().await.unwrap();
 
         // Verify schema is initialized
         let mut stmt = conn
@@ -263,8 +263,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_concurrent_write_detection() {
+    #[tokio::test]
+    async fn test_s3_concurrent_write_detection() {
         let _guard = match test_guard("test_s3_concurrent_write_detection") {
             Some(g) => g,
             None => return,
@@ -273,10 +273,10 @@ mod tests {
         let (_container, backend1) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend1.initialize().unwrap();
+        backend1.initialize().await.unwrap();
 
         // First download
-        let download1 = backend1.download().unwrap();
+        let download1 = backend1.download().await.unwrap();
         let etag1 = download1
             .remote_version
             .as_ref()
@@ -286,14 +286,14 @@ mod tests {
             .unwrap();
 
         // Simulate concurrent modification: upload to change ETag
-        backend1.upload(&download1).unwrap();
+        backend1.upload(&download1).await.unwrap();
 
         // Second backend with same bucket/object
         let backend2 = S3Backend::new("test-bucket", "catalog.db", "us-east-1")
             .expect("Failed to create backend2");
 
         // Second download gets new ETag
-        let download2 = backend2.download().unwrap();
+        let download2 = backend2.download().await.unwrap();
         let etag2 = download2
             .remote_version
             .as_ref()
@@ -306,7 +306,7 @@ mod tests {
         assert_ne!(etag1, etag2, "ETags should differ after upload");
 
         // Try to upload with stale ETag (download1)
-        let result = backend1.upload(&download1);
+        let result = backend1.upload(&download1).await;
 
         // Should fail with conflict error (after retries exhausted)
         assert!(result.is_err(), "Expected upload with stale ETag to fail");
@@ -330,8 +330,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_cache_disabled() {
+    #[tokio::test]
+    async fn test_s3_cache_disabled() {
         let _guard = match test_guard("test_s3_cache_disabled") {
             Some(g) => g,
             None => return,
@@ -344,14 +344,14 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // First download
-        let download1 = backend.download().unwrap();
+        let download1 = backend.download().await.unwrap();
         let path1 = download1.path.clone();
 
         // Second download (cache disabled, should get new temp file)
-        let download2 = backend.download().unwrap();
+        let download2 = backend.download().await.unwrap();
         let path2 = download2.path.clone();
 
         // Paths should be different (no caching)
@@ -368,8 +368,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_retry_logic() {
+    #[tokio::test]
+    async fn test_s3_retry_logic() {
         let _guard = match test_guard("test_s3_retry_logic") {
             Some(g) => g,
             None => return,
@@ -378,18 +378,18 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // Download to get initial state
-        let download = backend.download().unwrap();
+        let download = backend.download().await.unwrap();
 
         // First upload should succeed
-        let result = backend.upload(&download);
+        let result = backend.upload(&download).await;
         assert!(result.is_ok(), "First upload should succeed");
 
         // Second upload with same (now stale) download should trigger retries
         // After 3 retries with exponential backoff, it should fail
-        let result = backend.upload(&download);
+        let result = backend.upload(&download).await;
         assert!(
             result.is_err(),
             "Upload with stale version should fail after retries"
@@ -403,8 +403,8 @@ mod tests {
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
-    #[test]
-    fn test_s3_metadata_preservation() {
+    #[tokio::test]
+    async fn test_s3_metadata_preservation() {
         let _guard = match test_guard("test_s3_metadata_preservation") {
             Some(g) => g,
             None => return,
@@ -413,10 +413,10 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // Insert fake dataset to verify preservation
-        let conn = backend.get_connection().unwrap();
+        let conn = backend.get_connection().await.unwrap();
         conn.execute(
             "INSERT INTO datasets (name, format, uri, catalog_version) VALUES (?, ?, ?, ?)",
             rusqlite::params!["test_dataset", "parquet", "s3://bucket/data.parquet", 1],
@@ -424,7 +424,7 @@ mod tests {
         .unwrap();
 
         // Download should include the inserted data
-        let download = backend.download().unwrap();
+        let download = backend.download().await.unwrap();
         let conn2 = rusqlite::Connection::open(&download.path).unwrap();
 
         let mut stmt = conn2.prepare("SELECT name FROM datasets").unwrap();
