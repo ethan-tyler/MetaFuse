@@ -7,7 +7,9 @@ use metafuse_catalog_core::{init_sqlite_schema, CatalogError, Result};
 use rusqlite::Connection;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use std::sync::OnceLock;
 #[cfg(any(feature = "gcs", feature = "s3"))]
@@ -61,37 +63,55 @@ fn tokio_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// Backend abstraction for catalog storage
+/// Backend abstraction for catalog storage (async)
 ///
 /// Implementations handle different storage mechanisms:
 /// - Local filesystem (SQLite file)
 /// - GCS (SQLite on Google Cloud Storage)
 /// - S3 (SQLite on AWS S3)
+///
+/// # Safety
+///
+/// **CRITICAL**: Never hold `rusqlite::Connection` across `.await` points!
+/// rusqlite::Connection is !Send and will cause compilation errors.
+///
+/// Always use `tokio::task::spawn_blocking` for SQLite operations.
+///
+/// # Manual Async Trait
+///
+/// This trait uses manual async implementation (Pin<Box<dyn Future>>)
+/// instead of async-trait crate for zero-cost abstraction and explicit
+/// Send bounds.
 pub trait CatalogBackend: Send + Sync {
     /// Download the catalog to a local file and return its path plus version metadata.
     ///
     /// Local backends can simply return the existing path; cloud backends should
     /// download to a temporary location and capture generation/etag for later upload.
-    fn download(&self) -> Result<CatalogDownload>;
+    fn download(&self) -> Pin<Box<dyn Future<Output = Result<CatalogDownload>> + Send + '_>>;
 
     /// Upload a modified catalog file back to remote storage with optimistic locking.
     ///
     /// Cloud backends should use `version` preconditions (generation/etag) to avoid lost updates.
     /// Local backends can replace the on-disk file or simply no-op if paths match.
-    fn upload(&self, download: &CatalogDownload) -> Result<()>;
+    fn upload(
+        &self,
+        download: &CatalogDownload,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 
     /// Get a connection to the catalog database
     ///
     /// For local backends, this opens a direct connection.
     /// For cloud backends, this downloads the catalog file,
     /// opens it locally, and tracks the version for optimistic concurrency.
-    fn get_connection(&self) -> Result<Connection>;
+    ///
+    /// IMPORTANT: Use connection immediately, do not hold across await points
+    fn get_connection(&self) -> Pin<Box<dyn Future<Output = Result<Connection>> + Send + '_>>;
 
     /// Check if the catalog exists
-    fn exists(&self) -> Result<bool>;
+    fn exists(&self) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>>;
 
     /// Initialize a new catalog (create the database file)
-    fn initialize(&self) -> Result<()>;
+    fn initialize(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
 /// Parsed representation of a catalog URI.
@@ -261,61 +281,102 @@ impl LocalSqliteBackend {
 }
 
 impl CatalogBackend for LocalSqliteBackend {
-    fn download(&self) -> Result<CatalogDownload> {
-        // Open connection to read current version
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        init_sqlite_schema(&conn)?;
+    fn download(&self) -> Pin<Box<dyn Future<Output = Result<CatalogDownload>> + Send + '_>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            // All SQLite operations in spawn_blocking
+            tokio::task::spawn_blocking(move || {
+                // Open connection to read current version
+                let conn = Connection::open(&path)?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                init_sqlite_schema(&conn)?;
 
-        // Read current catalog version
-        let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
+                // Read current catalog version
+                let catalog_version = metafuse_catalog_core::get_catalog_version(&conn)?;
 
-        Ok(CatalogDownload {
-            path: self.path.clone(),
-            catalog_version,
-            remote_version: None, // Local backend has no remote versioning
+                Ok(CatalogDownload {
+                    path,
+                    catalog_version,
+                    remote_version: None, // Local backend has no remote versioning
+                })
+            })
+            .await
+            .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))?
         })
     }
 
-    fn upload(&self, download: &CatalogDownload) -> Result<()> {
-        // For local mode, if the download path differs, copy back; otherwise no-op.
-        if download.path != self.path {
-            fs::copy(&download.path, &self.path)
-                .map_err(|e| CatalogError::Other(format!("Failed to copy catalog file: {}", e)))?;
-        }
-        Ok(())
+    fn upload(
+        &self,
+        download: &CatalogDownload,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let self_path = self.path.clone();
+        let download_path = download.path.clone();
+        Box::pin(async move {
+            // File I/O in spawn_blocking (though fast, keeping pattern consistent)
+            tokio::task::spawn_blocking(move || {
+                // For local mode, if the download path differs, copy back; otherwise no-op.
+                if download_path != self_path {
+                    fs::copy(&download_path, &self_path).map_err(|e| {
+                        CatalogError::Other(format!("Failed to copy catalog file: {}", e))
+                    })?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))?
+        })
     }
 
-    fn get_connection(&self) -> Result<Connection> {
-        let download = self.download()?;
-        let conn = Connection::open(&download.path)?;
+    fn get_connection(&self) -> Pin<Box<dyn Future<Output = Result<Connection>> + Send + '_>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            // All SQLite operations in spawn_blocking
+            tokio::task::spawn_blocking(move || {
+                let conn = Connection::open(&path)?;
 
-        // Enable foreign key constraints
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                // Enable foreign key constraints
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
-        // Initialize schema if needed
-        init_sqlite_schema(&conn)?;
+                // Initialize schema if needed
+                init_sqlite_schema(&conn)?;
 
-        Ok(conn)
+                Ok(conn)
+            })
+            .await
+            .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))?
+        })
     }
 
-    fn exists(&self) -> Result<bool> {
-        Ok(self.path.exists())
+    fn exists(&self) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + '_>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            // File system check (fast, but keeping pattern for consistency)
+            Ok(path.exists())
+        })
     }
 
-    fn initialize(&self) -> Result<()> {
-        if self.exists()? {
-            return Err(CatalogError::Other(format!(
-                "Catalog already exists at {:?}",
-                self.path
-            )));
-        }
+    fn initialize(&self) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            // Check existence
+            if path.exists() {
+                return Err(CatalogError::Other(format!(
+                    "Catalog already exists at {:?}",
+                    path
+                )));
+            }
 
-        let conn = Connection::open(&self.path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        init_sqlite_schema(&conn)?;
+            // SQLite operations in spawn_blocking
+            tokio::task::spawn_blocking(move || {
+                let conn = Connection::open(&path)?;
+                conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+                init_sqlite_schema(&conn)?;
 
-        Ok(())
+                Ok(())
+            })
+            .await
+            .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))?
+        })
     }
 }
 
@@ -1025,8 +1086,8 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_local_backend_initialize() {
+    #[tokio::test]
+    async fn test_local_backend_initialize() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
 
@@ -1034,12 +1095,12 @@ mod tests {
         std::fs::remove_file(path).unwrap();
 
         let backend = LocalSqliteBackend::new(path);
-        assert!(!backend.exists().unwrap());
+        assert!(!backend.exists().await.unwrap());
 
-        backend.initialize().unwrap();
-        assert!(backend.exists().unwrap());
+        backend.initialize().await.unwrap();
+        assert!(backend.exists().await.unwrap());
 
-        let conn = backend.get_connection().unwrap();
+        let conn = backend.get_connection().await.unwrap();
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .unwrap()
@@ -1051,26 +1112,26 @@ mod tests {
         assert!(tables.contains(&"datasets".to_string()));
     }
 
-    #[test]
-    fn test_local_backend_double_initialize() {
+    #[tokio::test]
+    async fn test_local_backend_double_initialize() {
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
 
         std::fs::remove_file(path).unwrap();
 
         let backend = LocalSqliteBackend::new(path);
-        backend.initialize().unwrap();
+        backend.initialize().await.unwrap();
 
         // Second initialize should fail
-        assert!(backend.initialize().is_err());
+        assert!(backend.initialize().await.is_err());
     }
 
-    #[test]
-    fn test_local_backend_connection() {
+    #[tokio::test]
+    async fn test_local_backend_connection() {
         let temp_file = NamedTempFile::new().unwrap();
         let backend = LocalSqliteBackend::new(temp_file.path());
 
-        let conn = backend.get_connection().unwrap();
+        let conn = backend.get_connection().await.unwrap();
 
         // Test that foreign keys are enabled
         let fk_enabled: i32 = conn
