@@ -475,9 +475,10 @@ impl CatalogBackend for GcsBackend {
                 })?;
 
             // Extract generation number from metadata (GCS-specific)
-            let generation = get_result.meta.version.clone().ok_or_else(|| {
-                CatalogError::Other("Missing generation in GCS metadata".into())
-            })?;
+            let generation =
+                get_result.meta.version.clone().ok_or_else(|| {
+                    CatalogError::Other("Missing generation in GCS metadata".into())
+                })?;
 
             tracing::debug!(
                 object = %self.object_path,
@@ -543,9 +544,10 @@ impl CatalogBackend for GcsBackend {
                 CatalogError::Other("Missing remote version for GCS upload".into())
             })?;
 
-            let generation = remote_version.generation.as_ref().ok_or_else(|| {
-                CatalogError::Other("Missing generation for GCS upload".into())
-            })?;
+            let generation = remote_version
+                .generation
+                .as_ref()
+                .ok_or_else(|| CatalogError::Other("Missing generation for GCS upload".into()))?;
 
             // Read catalog file data once; clone bytes cheaply across retries
             let data = std::fs::read(&download.path)
@@ -572,11 +574,7 @@ impl CatalogBackend for GcsBackend {
 
                 let result = self
                     .store
-                    .put_opts(
-                        &self.object_path,
-                        PutPayload::from(data.clone()),
-                        put_opts,
-                    )
+                    .put_opts(&self.object_path, PutPayload::from(data.clone()), put_opts)
                     .await;
 
                 match result {
@@ -924,10 +922,9 @@ impl CatalogBackend for S3Backend {
             use object_store::{PutMode, PutOptions, PutPayload};
 
             // Validate remote version exists
-            let remote_version = download
-                .remote_version
-                .as_ref()
-                .ok_or_else(|| CatalogError::Other("Missing remote version for S3 upload".into()))?;
+            let remote_version = download.remote_version.as_ref().ok_or_else(|| {
+                CatalogError::Other("Missing remote version for S3 upload".into())
+            })?;
 
             let etag = remote_version
                 .etag

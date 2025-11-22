@@ -153,12 +153,13 @@ impl CatalogCache {
             }
 
             // Check TTL
-            let metadata = std::fs::metadata(&cache_key)
-                .map_err(|e| CatalogError::Other(format!("Failed to read cache metadata: {}", e)))?;
+            let metadata = std::fs::metadata(&cache_key).map_err(|e| {
+                CatalogError::Other(format!("Failed to read cache metadata: {}", e))
+            })?;
 
-            let modified = metadata
-                .modified()
-                .map_err(|e| CatalogError::Other(format!("Failed to get modification time: {}", e)))?;
+            let modified = metadata.modified().map_err(|e| {
+                CatalogError::Other(format!("Failed to get modification time: {}", e))
+            })?;
 
             let age = SystemTime::now()
                 .duration_since(modified)
@@ -175,11 +176,14 @@ impl CatalogCache {
             }
 
             // Read remote version from metadata file
-            let version_json = std::fs::read_to_string(&meta_path)
-                .map_err(|e| CatalogError::Other(format!("Failed to read cache metadata: {}", e)))?;
+            let version_json = std::fs::read_to_string(&meta_path).map_err(|e| {
+                CatalogError::Other(format!("Failed to read cache metadata: {}", e))
+            })?;
 
-            let remote_version: ObjectVersion = serde_json::from_str(&version_json)
-                .map_err(|e| CatalogError::Other(format!("Failed to parse cache metadata: {}", e)))?;
+            let remote_version: ObjectVersion =
+                serde_json::from_str(&version_json).map_err(|e| {
+                    CatalogError::Other(format!("Failed to parse cache metadata: {}", e))
+                })?;
 
             // Read catalog version (requires opening SQLite connection)
             let cache_key_clone = cache_key.clone();

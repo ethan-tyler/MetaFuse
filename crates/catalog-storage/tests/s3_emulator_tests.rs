@@ -139,7 +139,10 @@ mod tests {
         assert!(backend.initialize().await.is_ok());
 
         // Second initialize should fail (already exists)
-        assert!(matches!(backend.initialize().await, Err(CatalogError::Other(_))));
+        assert!(matches!(
+            backend.initialize().await,
+            Err(CatalogError::Other(_))
+        ));
 
         // Cleanup
         std::env::remove_var("AWS_ACCESS_KEY_ID");

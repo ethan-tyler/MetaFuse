@@ -269,8 +269,7 @@ impl<B: CatalogBackend> Emitter<B> {
 /// Perform dataset writes within a transaction
 fn write_dataset_tx(tx: &rusqlite::Transaction, dataset: &DatasetMeta) -> Result<()> {
     // Extract operational metadata
-    let (row_count, size_bytes, partition_keys_json) = if let Some(ref op) = dataset.operational
-    {
+    let (row_count, size_bytes, partition_keys_json) = if let Some(ref op) = dataset.operational {
         let partition_keys_json = if op.partition_keys.is_empty() {
             None
         } else {

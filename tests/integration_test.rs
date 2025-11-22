@@ -34,7 +34,7 @@ fn create_sample_schema() -> Arc<Schema> {
         Field::new("value", DataType::Float64, true),
     ]))
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_emit_and_query_dataset() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -58,7 +58,9 @@ async fn test_emit_and_query_dataset() {
             }),
             vec![],
             vec!["test".to_string()],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     // Query the dataset
     let conn = backend.get_connection().await.unwrap();
@@ -103,7 +105,7 @@ async fn test_emit_and_query_dataset() {
     assert_eq!(owner, Some("test@example.com".to_string()));
     assert_eq!(row_count, Some(100));
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_lineage_tracking() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -122,7 +124,9 @@ async fn test_lineage_tracking() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     emitter
         .emit_dataset(
@@ -137,7 +141,9 @@ async fn test_lineage_tracking() {
             None,
             vec!["parent_dataset".to_string()],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
     let lineage_count: i64 = conn
@@ -153,7 +159,7 @@ async fn test_lineage_tracking() {
 
     assert_eq!(lineage_count, 1);
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_multi_tenant_isolation() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -172,7 +178,9 @@ async fn test_multi_tenant_isolation() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     emitter
         .emit_dataset(
@@ -187,7 +195,9 @@ async fn test_multi_tenant_isolation() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
     let count_a: i64 = conn
@@ -208,7 +218,7 @@ async fn test_multi_tenant_isolation() {
     assert_eq!(count_a, 1);
     assert_eq!(count_b, 1);
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_upsert_dataset() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -231,7 +241,9 @@ async fn test_upsert_dataset() {
             }),
             vec![],
             vec!["v1".to_string()],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     emitter
         .emit_dataset(
@@ -250,7 +262,9 @@ async fn test_upsert_dataset() {
             }),
             vec![],
             vec!["v2".to_string()],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
     let (path, description, row_count): (String, Option<String>, Option<i64>) = conn
@@ -265,7 +279,7 @@ async fn test_upsert_dataset() {
     assert_eq!(description, Some("Version 2".to_string()));
     assert_eq!(row_count, Some(200));
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_tags() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -288,7 +302,9 @@ async fn test_tags() {
                 "important".to_string(),
                 "daily".to_string(),
             ],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
     let mut stmt = conn
@@ -308,7 +324,7 @@ async fn test_tags() {
 
     assert_eq!(tags, vec!["daily", "important", "prod"]);
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_schema_fields() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -327,7 +343,9 @@ async fn test_schema_fields() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
     let mut stmt = conn
@@ -356,7 +374,7 @@ async fn test_schema_fields() {
         ("value".to_string(), "Float64".to_string(), true)
     );
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_idempotent_emission() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -380,7 +398,9 @@ async fn test_idempotent_emission() {
                 }),
                 vec![],
                 vec!["test".to_string()],
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
     }
 
     let conn = backend.get_connection().await.unwrap();
@@ -394,7 +414,7 @@ async fn test_idempotent_emission() {
 
     assert_eq!(count, 1);
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_fts_search() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -414,7 +434,9 @@ async fn test_fts_search() {
             None,
             vec![],
             vec!["daily".to_string(), "transactions".to_string()],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     emitter
         .emit_dataset(
@@ -429,7 +451,9 @@ async fn test_fts_search() {
             None,
             vec![],
             vec!["users".to_string(), "profile".to_string()],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
 
@@ -467,7 +491,7 @@ async fn test_fts_search() {
 
     assert_eq!(results, vec!["transactions_daily"]);
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_partition_keys() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -491,7 +515,9 @@ async fn test_partition_keys() {
             }),
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
 
@@ -511,7 +537,7 @@ async fn test_partition_keys() {
         vec!["year".to_string(), "month".to_string(), "day".to_string()]
     );
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_domain_filtering() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -531,7 +557,9 @@ async fn test_domain_filtering() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     emitter
         .emit_dataset(
@@ -546,7 +574,9 @@ async fn test_domain_filtering() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     emitter
         .emit_dataset(
@@ -561,7 +591,9 @@ async fn test_domain_filtering() {
             None,
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
 
@@ -601,7 +633,7 @@ async fn test_domain_filtering() {
         vec!["finance_dataset_1", "finance_dataset_2"]
     );
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_operational_metadata() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend.clone());
@@ -625,7 +657,9 @@ async fn test_operational_metadata() {
             }),
             vec![],
             vec![],
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
     let conn = backend.get_connection().await.unwrap();
 
@@ -646,112 +680,126 @@ async fn test_operational_metadata() {
 }
 
 // ===== Validation Error Tests =====
-    #[tokio::test]
+#[tokio::test]
 async fn test_validation_reject_invalid_dataset_name() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
     // Test: Dataset name with spaces (invalid)
-    let result = emitter.emit_dataset(
-        "invalid dataset name", // Spaces not allowed
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        None,
-        None,
-        schema.clone(),
-        None,
-        vec![],
-        vec![],
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "invalid dataset name", // Spaces not allowed
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            None,
+            None,
+            schema.clone(),
+            None,
+            vec![],
+            vec![],
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("invalid characters"));
 
     // Test: Dataset name starting with hyphen (invalid)
-    let result = emitter.emit_dataset(
-        "-invalid",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        None,
-        None,
-        schema.clone(),
-        None,
-        vec![],
-        vec![],
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "-invalid",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            None,
+            None,
+            schema.clone(),
+            None,
+            vec![],
+            vec![],
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("cannot start or end with hyphen"));
 
     // Test: Empty dataset name (invalid)
-    let result = emitter.emit_dataset(
-        "",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        None,
-        None,
-        schema,
-        None,
-        vec![],
-        vec![],
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            None,
+            None,
+            schema,
+            None,
+            vec![],
+            vec![],
+        )
+        .await;
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("cannot be empty"));
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_validation_reject_invalid_tags() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
     // Test: Tag with spaces (invalid)
-    let result = emitter.emit_dataset(
-        "test_dataset",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        None,
-        None,
-        schema.clone(),
-        None,
-        vec![],
-        vec!["invalid tag".to_string()], // Space not allowed
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "test_dataset",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            None,
+            None,
+            schema.clone(),
+            None,
+            vec![],
+            vec!["invalid tag".to_string()], // Space not allowed
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("invalid characters"));
 
     // Test: Tag with @ symbol (invalid)
-    let result = emitter.emit_dataset(
-        "test_dataset",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        None,
-        None,
-        schema,
-        None,
-        vec![],
-        vec!["tag@value".to_string()], // @ not allowed
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "test_dataset",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            None,
+            None,
+            schema,
+            None,
+            vec![],
+            vec!["tag@value".to_string()], // @ not allowed
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("invalid characters"));
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_validation_reject_invalid_field_names() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
@@ -762,91 +810,102 @@ async fn test_validation_reject_invalid_field_names() {
         Field::new("invalid-field", DataType::Utf8, true), // Hyphen not allowed
     ]));
 
-    let result = emitter.emit_dataset(
-        "test_dataset",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        None,
-        None,
-        invalid_schema,
-        None,
-        vec![],
-        vec![],
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "test_dataset",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            None,
+            None,
+            invalid_schema,
+            None,
+            vec![],
+            vec![],
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("invalid characters"));
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_validation_reject_invalid_tenant_domain() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
     // Test: Tenant with colon (invalid)
-    let result = emitter.emit_dataset(
-        "test_dataset",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        Some("tenant:invalid"), // Colon not allowed in identifiers
-        None,
-        None,
-        schema.clone(),
-        None,
-        vec![],
-        vec![],
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "test_dataset",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            Some("tenant:invalid"), // Colon not allowed in identifiers
+            None,
+            None,
+            schema.clone(),
+            None,
+            vec![],
+            vec![],
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("invalid characters"));
 
     // Test: Domain with space (invalid)
-    let result = emitter.emit_dataset(
-        "test_dataset",
-        "/data/test.parquet",
-        "parquet",
-        None,
-        None,
-        Some("invalid domain"), // Space not allowed
-        None,
-        schema,
-        None,
-        vec![],
-        vec![],
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "test_dataset",
+            "/data/test.parquet",
+            "parquet",
+            None,
+            None,
+            Some("invalid domain"), // Space not allowed
+            None,
+            schema,
+            None,
+            vec![],
+            vec![],
+        )
+        .await;
     assert!(result.is_err());
-    assert!(result.unwrap_err()
+    assert!(result
+        .unwrap_err()
         .to_string()
         .contains("invalid characters"));
 }
-    #[tokio::test]
+#[tokio::test]
 async fn test_validation_accept_valid_inputs() {
     let (_temp_dir, backend) = create_test_backend().await;
     let emitter = Emitter::new(backend);
     let schema = create_sample_schema();
 
     // All valid inputs should succeed
-    let result = emitter.emit_dataset(
-        "valid_dataset-name.v2", // Valid: alphanumeric, underscore, hyphen, dot
-        "/data/test.parquet",
-        "parquet",
-        Some("Valid description"),
-        Some("prod-tenant"),      // Valid: alphanumeric, hyphen
-        Some("analytics_domain"), // Valid: alphanumeric, underscore
-        Some("team@example.com"),
-        schema,
-        Some(OperationalMeta {
-            row_count: Some(1000),
-            size_bytes: Some(50000),
-            partition_keys: vec!["year".to_string(), "month".to_string()],
-        }),
-        vec!["upstream_dataset".to_string()],
-        vec!["env:prod".to_string(), "team-analytics".to_string()], // Valid tags with colon and hyphen
-    ).await;
+    let result = emitter
+        .emit_dataset(
+            "valid_dataset-name.v2", // Valid: alphanumeric, underscore, hyphen, dot
+            "/data/test.parquet",
+            "parquet",
+            Some("Valid description"),
+            Some("prod-tenant"),      // Valid: alphanumeric, hyphen
+            Some("analytics_domain"), // Valid: alphanumeric, underscore
+            Some("team@example.com"),
+            schema,
+            Some(OperationalMeta {
+                row_count: Some(1000),
+                size_bytes: Some(50000),
+                partition_keys: vec!["year".to_string(), "month".to_string()],
+            }),
+            vec!["upstream_dataset".to_string()],
+            vec!["env:prod".to_string(), "team-analytics".to_string()], // Valid tags with colon and hyphen
+        )
+        .await;
     assert!(result.is_ok());
 }
