@@ -33,14 +33,17 @@ jobs:
         with:
           key: ${{ matrix.os }}-${{ matrix.rust }}
 
-      - name: Build workspace
-        run: cargo build --workspace --all-features --verbose
+      - name: Build workspace (default features)
+        run: cargo build --workspace --verbose
 
-      - name: Run unit and integration tests
-        run: cargo test --workspace --all-features --verbose
+      - name: Run unit and integration tests (default features)
+        run: cargo test --workspace --verbose
 
-      - name: Run documentation tests
-        run: cargo test --doc --workspace --all-features --verbose
+      - name: Run documentation tests (default features)
+        run: cargo test --doc --workspace --verbose
+
+      - name: Test metrics feature
+        run: cargo test -p metafuse-catalog-api --features metrics --verbose
 
   examples:
     name: Examples Smoke Test
@@ -81,8 +84,11 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --workspace --all-features --verbose
+      - name: Build release binary (default features)
+        run: cargo build --release --workspace --verbose
+
+      - name: Build release binary (with metrics)
+        run: cargo build --release -p metafuse-catalog-api --features metrics --verbose
 
       - name: Check binary size
         run: |
