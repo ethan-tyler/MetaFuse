@@ -250,6 +250,15 @@ impl RateLimiter {
         let now = Instant::now();
         let window_duration = Duration::from_secs(self.config.window_secs);
 
+        // Automatic cleanup: if bucket count exceeds threshold, clean up stale buckets
+        let threshold = self.config.max_buckets / 2;
+        if self.buckets.len() > threshold {
+            let ttl = Duration::from_secs(self.config.bucket_ttl_secs);
+            self.buckets.retain(|_, bucket| {
+                now.duration_since(bucket.last_accessed) < ttl
+            });
+        }
+
         let mut bucket = self
             .buckets
             .entry(key.clone())
