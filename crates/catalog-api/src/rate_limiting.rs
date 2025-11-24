@@ -323,11 +323,92 @@ impl RateLimiter {
     }
 }
 
+/// Rate limit metadata for response headers
+#[derive(Debug, Clone)]
+pub struct RateLimitMetadata {
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset: u64,
+    pub retry_after: Option<u64>,
+}
+
+impl RateLimiter {
+    /// Check rate limit and return metadata for headers
+    pub fn check_rate_limit_with_metadata<B>(
+        &self,
+        req: &Request<B>,
+    ) -> (Result<(), u64>, RateLimitMetadata) {
+        let (key, limit) = self.get_rate_limit_key(req);
+        let now = Instant::now();
+        let window_duration = Duration::from_secs(self.config.window_secs);
+
+        let mut bucket = self.buckets.entry(key.clone()).or_insert_with(|| {
+            RateLimitBucket {
+                count: 0,
+                window_start: now,
+                last_accessed: now,
+            }
+        });
+
+        bucket.last_accessed = now;
+
+        // Check if window has expired
+        if now.duration_since(bucket.window_start) >= window_duration {
+            bucket.window_start = now;
+            bucket.count = 0;
+        }
+
+        // Calculate reset time (window_start + window_duration as unix timestamp)
+        let reset_instant = bucket.window_start + window_duration;
+        let reset_secs = reset_instant
+            .duration_since(Instant::now())
+            .as_secs()
+            .saturating_add(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+
+        // Check if limit exceeded
+        if bucket.count >= limit {
+            let retry_after = self
+                .config
+                .window_secs
+                .saturating_sub(now.duration_since(bucket.window_start).as_secs());
+
+            let metadata = RateLimitMetadata {
+                limit,
+                remaining: 0,
+                reset: reset_secs,
+                retry_after: Some(retry_after),
+            };
+
+            return (Err(retry_after), metadata);
+        }
+
+        // Increment counter
+        bucket.count += 1;
+        let remaining = limit.saturating_sub(bucket.count);
+
+        let metadata = RateLimitMetadata {
+            limit,
+            remaining,
+            reset: reset_secs,
+            retry_after: None,
+        };
+
+        (Ok(()), metadata)
+    }
+}
+
 /// Rate limiting middleware
 pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    use axum::http::header::{HeaderName, HeaderValue};
+
     // Get or create rate limiter from extensions
     let rate_limiter = req
         .extensions()
@@ -341,18 +422,68 @@ pub async fn rate_limit_middleware(
         .map(|id| id.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // Check rate limit
-    match rate_limiter.check_rate_limit(&req) {
-        Ok(()) => Ok(next.run(req).await),
+    // Check rate limit and get metadata
+    let (result, metadata) = rate_limiter.check_rate_limit_with_metadata(&req);
+
+    match result {
+        Ok(()) => {
+            let mut response = next.run(req).await;
+
+            // Add rate limit headers to success response
+            let headers = response.headers_mut();
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-limit"),
+                HeaderValue::from(metadata.limit),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-remaining"),
+                HeaderValue::from(metadata.remaining),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-reset"),
+                HeaderValue::from(metadata.reset),
+            );
+
+            Ok(response)
+        }
         Err(retry_after) => {
             let error_body = json!({
-                "error": "Rate limit exceeded",
-                "message": "Too many requests. Please retry after the specified time.",
+                "error": {
+                    "code": "RATE_LIMIT_EXCEEDED",
+                    "message": "Too many requests. Please retry after the specified time.",
+                },
                 "request_id": request_id,
                 "retry_after": retry_after,
             });
 
-            Err((StatusCode::TOO_MANY_REQUESTS, Json(error_body)))
+            // Convert to full Response to add headers
+            let json_body = serde_json::to_string(&error_body).unwrap();
+            let mut full_response = Response::new(json_body.into());
+            *full_response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+
+            let headers = full_response.headers_mut();
+            headers.insert(
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static("application/json"),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-limit"),
+                HeaderValue::from(metadata.limit),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-remaining"),
+                HeaderValue::from(0u32),
+            );
+            headers.insert(
+                HeaderName::from_static("x-ratelimit-reset"),
+                HeaderValue::from(metadata.reset),
+            );
+            headers.insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from(retry_after),
+            );
+
+            Ok(full_response)
         }
     }
 }

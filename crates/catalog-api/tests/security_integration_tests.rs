@@ -13,6 +13,7 @@
 
 #[cfg(all(feature = "rate-limiting", feature = "api-keys"))]
 mod security_tests {
+    use serial_test::serial;
     use axum::{
         body::Body,
         extract::ConnectInfo,
@@ -20,7 +21,7 @@ mod security_tests {
         middleware,
         response::Response,
         routing::get,
-        Extension, Router,
+        Router,
     };
     use serde_json::Value;
     use std::net::SocketAddr;
@@ -39,7 +40,18 @@ mod security_tests {
         serde_json::from_slice(&body).expect("Failed to parse JSON")
     }
 
+    /// Helper middleware to inject RateLimiter into request extensions
+    async fn inject_rate_limiter(
+        mut req: Request<Body>,
+        next: middleware::Next,
+        limiter: metafuse_catalog_api::rate_limiting::RateLimiter,
+    ) -> Response {
+        req.extensions_mut().insert(limiter);
+        next.run(req).await
+    }
+
     #[tokio::test]
+    #[serial]
     async fn test_error_responses_include_request_id() {
         // This test verifies that all error responses (401, 429, 500) include request_id
         // for request correlation and debugging
@@ -53,10 +65,13 @@ mod security_tests {
         let limiter = rate_limiting::RateLimiter::new(config);
 
         // Create app with rate limiting
+        // Note: Layers execute in reverse order, so rate_limit_middleware runs after inject_rate_limiter
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(Extension(limiter))
-            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
+            .layer(middleware::from_fn(move |req, next| {
+                inject_rate_limiter(req, next, limiter.clone())
+            }));
 
         // First request should succeed
         let req = Request::builder()
@@ -93,6 +108,7 @@ mod security_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_rate_limit_tiering_authenticated_vs_anonymous() {
         // This test verifies that authenticated clients get higher rate limits
         // than anonymous clients
@@ -106,10 +122,13 @@ mod security_tests {
         let limiter = rate_limiting::RateLimiter::new(config);
 
         // Create app with rate limiting
+        // Note: Layers execute in reverse order, so rate_limit_middleware runs after inject_rate_limiter
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(Extension(limiter))
-            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
+            .layer(middleware::from_fn(move |req, next| {
+                inject_rate_limiter(req, next, limiter.clone())
+            }));
 
         // Test anonymous limit (should be 2)
         for i in 1..=2 {
@@ -153,6 +172,7 @@ mod security_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_invalid_api_keys_use_anonymous_limits() {
         // CRITICAL SECURITY TEST
         // This verifies that invalid API keys do NOT receive elevated rate limits
@@ -168,10 +188,13 @@ mod security_tests {
 
         // Create app with rate limiting (no auth middleware)
         // This simulates what happens when auth middleware rejects an invalid key
+        // Note: Layers execute in reverse order, so rate_limit_middleware runs after inject_rate_limiter
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(Extension(limiter))
-            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
+            .layer(middleware::from_fn(move |req, next| {
+                inject_rate_limiter(req, next, limiter.clone())
+            }));
 
         // First request with invalid API key (no ApiKeyId extension)
         let req = Request::builder()
@@ -214,6 +237,7 @@ mod security_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_rate_limit_headers_present() {
         // This test verifies that rate limit headers are correctly set
         // Expected headers: X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset
@@ -226,10 +250,13 @@ mod security_tests {
         let limiter = rate_limiting::RateLimiter::new(config);
 
         // Create app with rate limiting
+        // Note: Layers execute in reverse order, so rate_limit_middleware runs after inject_rate_limiter
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(Extension(limiter))
-            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
+            .layer(middleware::from_fn(move |req, next| {
+                inject_rate_limiter(req, next, limiter.clone())
+            }));
 
         // Make request
         let req = Request::builder()
@@ -272,6 +299,7 @@ mod security_tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_retry_after_header_on_429() {
         // This test verifies that 429 responses include Retry-After header
         // as specified in RFC 6585
@@ -284,10 +312,13 @@ mod security_tests {
         let limiter = rate_limiting::RateLimiter::new(config);
 
         // Create app with rate limiting
+        // Note: Layers execute in reverse order, so rate_limit_middleware runs after inject_rate_limiter
         let app = Router::new()
             .route("/test", get(mock_handler))
-            .layer(Extension(limiter))
-            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware));
+            .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
+            .layer(middleware::from_fn(move |req, next| {
+                inject_rate_limiter(req, next, limiter.clone())
+            }));
 
         // First request to establish bucket
         let req = Request::builder()
