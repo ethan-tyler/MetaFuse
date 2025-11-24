@@ -271,28 +271,6 @@ Uses MinIO Docker image. Tests cover:
 - Clean up containers after test completion
 - Run in isolated environments (no credential leakage)
 
-### Stress Tests
-
-Stress tests validate concurrent access patterns and resource management under load. These tests are opt-in and NOT run in CI by default.
-
-```bash
-# Run stress tests (no Docker required, skipped by default)
-RUN_STRESS_TESTS=1 cargo test --test stress_tests
-
-# Configure concurrency and duration
-RUN_STRESS_TESTS=1 STRESS_TEST_CLIENTS=20 STRESS_TEST_DURATION_SECS=60 cargo test --test stress_tests
-```
-
-Tests cover:
-
-- Concurrent writers with optimistic locking
-- Read-heavy workloads (cache performance)
-- Optimistic lock resolution and retry logic
-- Cache invalidation race conditions
-- Connection cleanup and resource leak detection
-
-See [Stress Testing Guide](docs/STRESS-TESTING.md) for detailed information.
-
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** - 10-minute tutorial

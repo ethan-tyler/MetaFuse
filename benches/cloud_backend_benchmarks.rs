@@ -16,8 +16,9 @@
 //! RUN_CLOUD_TESTS=1 cargo bench --features s3 --bench cloud_backend_benchmarks -- s3
 //! ```
 
+use chrono::Utc;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use metafuse_catalog_core::{init_sqlite_schema, DatasetMeta, FieldMeta};
+use metafuse_catalog_core::{init_sqlite_schema, DatasetMeta, FieldMeta, OperationalMeta};
 use std::time::Duration;
 
 #[cfg(any(feature = "gcs", feature = "s3"))]
@@ -43,19 +44,22 @@ fn create_test_dataset(name: &str, size_kb: usize) -> DatasetMeta {
 
     DatasetMeta {
         name: name.to_string(),
-        uri: format!("file:///tmp/bench/{}.parquet", name),
+        path: format!("file:///tmp/bench/{}.parquet", name),
         format: "parquet".to_string(),
         description: Some(format!("Benchmark dataset {}KB", size_kb)),
-        owner: Some("benchmark".to_string()),
+        tenant: None,
         domain: Some("bench-domain".to_string()),
-        tags: vec!["benchmark".to_string()],
+        owner: Some("benchmark".to_string()),
+        created_at: Utc::now(),
+        last_updated: Utc::now(),
         fields,
-        partitions: None,
-        size_bytes: Some((size_kb * 1024) as u64),
-        row_count: Some(1000),
         upstream_datasets: vec![],
-        last_modified_at: None,
-        version: None,
+        tags: vec!["benchmark".to_string()],
+        operational: Some(OperationalMeta {
+            row_count: Some(1000),
+            size_bytes: Some((size_kb * 1024) as i64),
+            partition_keys: vec![],
+        }),
     }
 }
 
