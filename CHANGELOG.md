@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### v0.5.0 - Production Hardening & Legacy Removal
+
+#### BREAKING CHANGES
+
+- **Removed `legacy-sync` feature flag**: The synchronous API adapter has been removed.
+  All code must use async/await APIs introduced in v0.4.0.
+  - If you're on v0.4.x with async APIs: **No changes required**
+  - If you're using `SyncBackendAdapter`: See [MIGRATION-v0.5.md](docs/MIGRATION-v0.5.md) for upgrade path
+
+#### Removed
+
+- Deprecated `sync_adapter` module (`crates/catalog-storage/src/sync_adapter.rs`)
+- `legacy-sync` Cargo feature flag from `catalog-storage`
+- `legacy-sync` feature dependency in `catalog-cli`
+- Legacy v0.3.x code in `MetaFuse/` directory
+
+#### Added
+
+- Cloud emulator tests in CI (GCS with fake-gcs-server, S3 with MinIO)
+  - Gated behind `RUN_CLOUD_TESTS=1` environment variable
+  - Only runs on main repository (not forks)
+  - Serialized execution to prevent port conflicts
+- Concurrency stress test suite (opt-in via `RUN_STRESS_TESTS=1`)
+  - Multi-writer conflict scenarios
+  - Read-heavy load testing
+  - Cache consistency validation
+  - Retry exhaustion testing
+- Comprehensive v0.5.0 migration guide
+
+#### Improved
+
+- CI safety: Docker availability checks, fork detection, timeouts
+- Documentation: Updated roadmap to reflect async completion
+- Test isolation: Emulator tests run in separate CI job
+
+**Migration Guide**: [docs/MIGRATION-v0.5.md](docs/MIGRATION-v0.5.md)
+
 ---
 
 ## [0.4.3] - 2025-01-24
