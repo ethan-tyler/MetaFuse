@@ -13,7 +13,6 @@
 
 #[cfg(all(feature = "rate-limiting", feature = "api-keys"))]
 mod security_tests {
-    use serial_test::serial;
     use axum::{
         body::Body,
         extract::ConnectInfo,
@@ -24,6 +23,7 @@ mod security_tests {
         Router,
     };
     use serde_json::Value;
+    use serial_test::serial;
     use std::net::SocketAddr;
     use tower::ServiceExt;
 

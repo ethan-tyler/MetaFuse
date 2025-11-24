@@ -76,7 +76,11 @@ pub struct RateLimitConfig {
     pub authenticated_limit: u32,
     pub window_secs: u64,
     pub trusted_proxies: Option<Vec<String>>,
+    /// Reserved for future bucket cleanup implementation
+    #[allow(dead_code)]
     pub max_buckets: usize,
+    /// Reserved for future bucket cleanup implementation
+    #[allow(dead_code)]
     pub bucket_ttl_secs: u64,
 }
 
@@ -207,36 +211,6 @@ impl RateLimiter {
         })
     }
 
-    /// Clean up old buckets that haven't been accessed recently
-    ///
-    /// This prevents unbounded memory growth from high-cardinality keys.
-    ///
-    /// **Performance Note**: This is an O(n) operation that scans all buckets.
-    /// It's triggered when bucket count exceeds max_buckets/2 to amortize the cost.
-    fn cleanup_old_buckets(&self) {
-        let now = Instant::now();
-        let ttl = Duration::from_secs(self.config.bucket_ttl_secs);
-
-        let before_count = self.buckets.len();
-        self.buckets.retain(|key, bucket| {
-            let should_keep = now.duration_since(bucket.last_accessed) < ttl;
-            if !should_keep {
-                debug!(key = %key, "Evicting idle rate limit bucket");
-            }
-            should_keep
-        });
-
-        let evicted = before_count.saturating_sub(self.buckets.len());
-        if evicted > 0 {
-            debug!(
-                evicted = evicted,
-                remaining = self.buckets.len(),
-                ttl_secs = self.config.bucket_ttl_secs,
-                "Cleaned up idle buckets"
-            );
-        }
-    }
-
     fn get_rate_limit_key<B>(&self, req: &Request<B>) -> (String, u32) {
         // Priority 1: Check for authenticated API key
         if let Some(api_key) = req.extensions().get::<ApiKeyId>() {
@@ -256,71 +230,6 @@ impl RateLimiter {
         warn!("Could not extract rate limit key, using 'unknown'");
         ("anon:unknown".to_string(), self.config.anonymous_limit)
     }
-
-    pub fn check_rate_limit<B>(&self, req: &Request<B>) -> Result<(), u64> {
-        // Periodically clean up old buckets to prevent unbounded memory growth
-        // Trigger at 50% of max to amortize O(n) cleanup cost
-        let cleanup_threshold = self.config.max_buckets / 2;
-        if self.buckets.len() > cleanup_threshold {
-            debug!(
-                bucket_count = self.buckets.len(),
-                threshold = cleanup_threshold,
-                max_buckets = self.config.max_buckets,
-                "Bucket count threshold reached, cleaning up"
-            );
-            self.cleanup_old_buckets();
-        }
-
-        let (key, limit) = self.get_rate_limit_key(req);
-        let now = Instant::now();
-        let window_duration = Duration::from_secs(self.config.window_secs);
-
-        let mut bucket = self.buckets.entry(key.clone()).or_insert_with(|| {
-            debug!(key = %key, "Creating new rate limit bucket");
-            RateLimitBucket {
-                count: 0,
-                window_start: now,
-                last_accessed: now,
-            }
-        });
-
-        // Update last accessed time
-        bucket.last_accessed = now;
-
-        // Check if window has expired
-        if now.duration_since(bucket.window_start) >= window_duration {
-            debug!(key = %key, "Rate limit window expired, resetting");
-            bucket.window_start = now;
-            bucket.count = 0;
-        }
-
-        // Check if limit exceeded
-        if bucket.count >= limit {
-            let retry_after = self
-                .config
-                .window_secs
-                .saturating_sub(now.duration_since(bucket.window_start).as_secs());
-            warn!(
-                key = %key,
-                count = bucket.count,
-                limit = limit,
-                retry_after = retry_after,
-                "Rate limit exceeded"
-            );
-            return Err(retry_after);
-        }
-
-        // Increment counter
-        bucket.count += 1;
-        debug!(
-            key = %key,
-            count = bucket.count,
-            limit = limit,
-            "Request allowed"
-        );
-
-        Ok(())
-    }
 }
 
 /// Rate limit metadata for response headers
@@ -329,7 +238,6 @@ pub struct RateLimitMetadata {
     pub limit: u32,
     pub remaining: u32,
     pub reset: u64,
-    pub retry_after: Option<u64>,
 }
 
 impl RateLimiter {
@@ -342,13 +250,14 @@ impl RateLimiter {
         let now = Instant::now();
         let window_duration = Duration::from_secs(self.config.window_secs);
 
-        let mut bucket = self.buckets.entry(key.clone()).or_insert_with(|| {
-            RateLimitBucket {
+        let mut bucket = self
+            .buckets
+            .entry(key.clone())
+            .or_insert_with(|| RateLimitBucket {
                 count: 0,
                 window_start: now,
                 last_accessed: now,
-            }
-        });
+            });
 
         bucket.last_accessed = now;
 
@@ -381,7 +290,6 @@ impl RateLimiter {
                 limit,
                 remaining: 0,
                 reset: reset_secs,
-                retry_after: Some(retry_after),
             };
 
             return (Err(retry_after), metadata);
@@ -395,7 +303,6 @@ impl RateLimiter {
             limit,
             remaining,
             reset: reset_secs,
-            retry_after: None,
         };
 
         (Ok(()), metadata)
