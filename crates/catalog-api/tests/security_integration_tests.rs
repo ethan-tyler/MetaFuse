@@ -20,8 +20,7 @@ mod security_tests {
         middleware,
         response::Response,
         routing::get,
-        Extension,
-        Router,
+        Extension, Router,
     };
     use serde_json::Value;
     use std::net::SocketAddr;
