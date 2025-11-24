@@ -455,11 +455,13 @@ mod tests {
 
         // Should allow 5 requests
         for _ in 0..5 {
-            assert!(limiter.check_rate_limit(&req).is_ok());
+            let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+            assert!(result.is_ok());
         }
 
         // 6th request should be blocked
-        assert!(limiter.check_rate_limit(&req).is_err());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -522,29 +524,14 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.{}:8080", i).parse().unwrap();
             let mut req = Request::builder().body(()).unwrap();
             req.extensions_mut().insert(ConnectInfo(addr));
-            assert!(limiter.check_rate_limit(&req).is_ok());
+            let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+            assert!(result.is_ok());
         }
 
         assert_eq!(limiter.buckets.len(), 10, "Should have 10 buckets");
 
-        // Manually trigger cleanup with all buckets marked as old
-        // (In production this would happen naturally with TTL)
-        // For testing, we'll directly manipulate the buckets to set old timestamps
-        for mut entry in limiter.buckets.iter_mut() {
-            let bucket = entry.value_mut();
-            // Set last_accessed to be older than TTL
-            bucket.last_accessed =
-                Instant::now() - Duration::from_secs(DEFAULT_BUCKET_TTL_SECS + 1);
-        }
-
-        // Trigger cleanup
-        limiter.cleanup_old_buckets();
-
-        assert_eq!(
-            limiter.buckets.len(),
-            0,
-            "All old buckets should be evicted"
-        );
+        // Note: cleanup_old_buckets() was removed. Cleanup now happens automatically
+        // in check_rate_limit_with_metadata() when bucket threshold is exceeded.
     }
 
     #[test]
@@ -563,16 +550,12 @@ mod tests {
         req.extensions_mut().insert(ConnectInfo(addr));
 
         // Make a request to create bucket
-        assert!(limiter.check_rate_limit(&req).is_ok());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+        assert!(result.is_ok());
         assert_eq!(limiter.buckets.len(), 1);
 
-        // Cleanup should not remove recently accessed bucket
-        limiter.cleanup_old_buckets();
-        assert_eq!(
-            limiter.buckets.len(),
-            1,
-            "Active bucket should not be evicted"
-        );
+        // Note: cleanup_old_buckets() was removed. Cleanup now happens automatically
+        // when bucket threshold is exceeded, and active buckets are preserved.
     }
 
     #[test]
@@ -648,7 +631,8 @@ mod tests {
             let addr: SocketAddr = format!("127.0.0.{}:8080", i).parse().unwrap();
             let mut req = Request::builder().body(()).unwrap();
             req.extensions_mut().insert(ConnectInfo(addr));
-            assert!(limiter.check_rate_limit(&req).is_ok());
+            let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+            assert!(result.is_ok());
         }
 
         assert_eq!(limiter.buckets.len(), 10, "Should have 10 buckets");
@@ -663,7 +647,8 @@ mod tests {
         let addr: SocketAddr = "127.0.0.11:8080".parse().unwrap();
         let mut req = Request::builder().body(()).unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
-        assert!(limiter.check_rate_limit(&req).is_ok());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req);
+        assert!(result.is_ok());
 
         // Now we have 11 buckets (10 stale + 1 fresh). Next request should trigger cleanup
         assert_eq!(limiter.buckets.len(), 11);
@@ -672,7 +657,8 @@ mod tests {
         let addr2: SocketAddr = "127.0.0.12:8080".parse().unwrap();
         let mut req2 = Request::builder().body(()).unwrap();
         req2.extensions_mut().insert(ConnectInfo(addr2));
-        assert!(limiter.check_rate_limit(&req2).is_ok());
+        let (result, _metadata) = limiter.check_rate_limit_with_metadata(&req2);
+        assert!(result.is_ok());
 
         // After cleanup, should only have the 2 fresh buckets (11 and 12)
         assert_eq!(
