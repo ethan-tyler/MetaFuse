@@ -17,7 +17,7 @@ api-keys = ["dep:metafuse-catalog-api", "metafuse-catalog-api/api-keys"]
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
-metafuse-catalog-storage = { path = "../catalog-storage", features = ["legacy-sync"] }
+metafuse-catalog-storage = { path = "../catalog-storage" }
 metafuse-catalog-api = { path = "../catalog-api", optional = true }
 
 clap.workspace = true

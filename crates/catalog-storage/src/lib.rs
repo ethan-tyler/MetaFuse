@@ -21,14 +21,6 @@ use bytes::Bytes;
 #[cfg(any(feature = "gcs", feature = "s3"))]
 use cache::{CatalogCache, HeadCheckBackend};
 
-// Legacy sync adapter (deprecated, removal in v0.5.0)
-#[cfg(feature = "legacy-sync")]
-#[deprecated(
-    since = "0.4.0",
-    note = "Use async CatalogBackend methods directly. Removal in v0.5.0"
-)]
-pub mod sync_adapter;
-
 /// Convenience alias for trait objects.
 pub type DynCatalogBackend = dyn CatalogBackend;
 

@@ -238,37 +238,54 @@ Only validated API keys get identity attached, ensuring attackers cannot bypass 
 
 ---
 
-## Phase 2.1: Cloud Backend Enhancements (v0.5.0 - Q2 2025)
+## Phase 2.1: Production Hardening (v0.5.0 - Q1 2025)
 
-**Goal:** Improve cloud backend performance, testing, and developer experience.
+**Goal:** Remove technical debt, enhance CI validation, and improve production confidence.
 
-### Planned Features
+**Note:** Async backend refactoring was completed in v0.4.0. This phase focuses on cleanup and testing infrastructure.
 
-- **Async Backend Refactoring**
-  - Convert `CatalogBackend` trait methods to async
-  - Eliminate blocking calls on shared Tokio runtime
-  - Improve throughput for high-concurrency workloads
-  - Cleaner integration with async API/CLI codebases
+### Completed
 
-- **Emulator Integration Tests**
-  - Add `fake-gcs-server` tests for GCS backend
-  - Add `localstack` tests for S3 backend
-  - Gate tests behind `RUN_CLOUD_TESTS=1` environment variable
-  - Test optimistic locking conflict scenarios
-  - Test retry logic and exponential backoff
-  - Verify cache invalidation behavior
+- [done] **Async Backend Migration** (completed in v0.4.0)
+  - All `CatalogBackend` methods are fully async using `Pin<Box<dyn Future>>`
+  - Zero blocking calls in cloud backends (native async HTTP)
+  - SQLite operations use `tokio::task::spawn_blocking`
+  - Full async/await throughout API, CLI, and Emitter
 
-- **Optional Cache Revalidation**
-  - Add `METAFUSE_CACHE_REVALIDATE=true` flag
-  - Perform HEAD request on cache hits to check staleness
-  - Trade extra cloud call for stronger consistency
-  - Document when to enable (critical reads) vs. disable (cost optimization)
+### In Progress (v0.5.0)
 
-- **Performance Optimizations**
-  - Benchmark upload/download throughput
-  - Profile cache hit rates in production workloads
-  - Optimize temp file handling (reduce copies)
-  - Add connection pooling for concurrent operations
+- **Legacy Code Removal** (Breaking Changes)
+  - Remove deprecated `sync_adapter` module
+  - Remove `legacy-sync` feature flag
+  - Clean up old v0.3.x code in `MetaFuse/` directory
+  - Create comprehensive migration guide
+
+- **CI Enhancement**
+  - Add cloud emulator tests to CI (gated, non-blocking)
+    - GCS: `fake-gcs-server` Docker container
+    - S3: MinIO Docker container
+    - Environment variable: `RUN_CLOUD_TESTS=1`
+    - Fork detection and Docker availability checks
+  - Concurrency stress tests (opt-in via `RUN_STRESS_TESTS=1`)
+    - Multi-writer conflict scenarios
+    - Read-heavy load testing
+    - Cache consistency validation
+  - CI safety improvements
+    - Timeout limits for all jobs
+    - Graceful failure on Docker unavailability
+    - Non-blocking emulator tests initially
+
+### Future (v0.5.1+)
+
+- **Performance Optimizations** (Deferred)
+  - Async cache `put()` and `invalidate()` methods
+  - Stale-while-revalidate caching pattern
+  - Connection pooling for high-concurrency scenarios
+  - Benchmark suite for throughput measurement
+
+### Note on Cache Revalidation
+
+Cache revalidation with `METAFUSE_CACHE_REVALIDATE=true` **already exists** in v0.4.0. This optional feature performs HEAD requests on cache hits to verify freshness. See [Cloud Emulator Testing Guide](cloud-emulator-tests.md) for details.
 
 ---
 
