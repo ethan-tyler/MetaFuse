@@ -174,9 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
     };
 
-    let app = app
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = app.layer(CorsLayer::permissive()).with_state(state);
 
     // Get port from environment or use default
     let port = std::env::var("METAFUSE_PORT")

@@ -42,7 +42,7 @@
 //! - Background tasks should check revocation status periodically
 //!
 //! ### Authentication Best Practices
-//! - **Prefer**: `Authorization: Bearer <token>` header
+//! - **Prefer**: `Authorization: Bearer TOKEN` header
 //! - **Avoid**: Query parameters in production (logged by proxies/servers)
 //! - **Rotate**: Keys regularly, especially after personnel changes
 //! - **Monitor**: Track `last_used_at` for stale/compromised keys
@@ -148,8 +148,8 @@ pub struct ValidatedKeyInfo {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 struct CachedKey {
-    bcrypt_hash: String,     // Store bcrypt hash to avoid DB lookup and for marking as used
-    name: String,            // Store name for identity-aware operations
+    bcrypt_hash: String, // Store bcrypt hash to avoid DB lookup and for marking as used
+    name: String,        // Store name for identity-aware operations
     cached_at: Instant,
 }
 
@@ -174,7 +174,7 @@ fn cache_key_from_plaintext(plaintext: &str) -> u64 {
 pub struct ApiKeyManager {
     config: ApiKeyConfig,
     db_path: String,
-    cache: Arc<DashMap<u64, CachedKey>>,           // Keyed by hash, not plaintext
+    cache: Arc<DashMap<u64, CachedKey>>, // Keyed by hash, not plaintext
     pending_updates: Arc<DashMap<String, Instant>>, // Keyed by bcrypt hash
 }
 
@@ -202,11 +202,9 @@ impl ApiKeyManager {
         let key_hash = {
             let plaintext = plaintext_key.clone();
             let cost = self.config.bcrypt_cost;
-            tokio::task::spawn_blocking(move || {
-                hash(&plaintext, cost).map_err(|e| e.to_string())
-            })
-            .await
-            .map_err(|e| e.to_string())??
+            tokio::task::spawn_blocking(move || hash(&plaintext, cost).map_err(|e| e.to_string()))
+                .await
+                .map_err(|e| e.to_string())??
         };
 
         // Store in database
@@ -234,7 +232,10 @@ impl ApiKeyManager {
     /// Returns `Ok(Some(info))` if valid, `Ok(None)` if invalid, `Err` on validation error.
     ///
     /// **Use this** when you need the key's identity for downstream operations (e.g., rate limiting).
-    pub async fn validate_key_with_info(&self, plaintext_key: &str) -> Result<Option<ValidatedKeyInfo>, String> {
+    pub async fn validate_key_with_info(
+        &self,
+        plaintext_key: &str,
+    ) -> Result<Option<ValidatedKeyInfo>, String> {
         let cache_key = cache_key_from_plaintext(plaintext_key);
 
         // Check cache first
@@ -261,9 +262,9 @@ impl ApiKeyManager {
             let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
 
             // Get all non-revoked key hashes
-            let mut stmt = conn.prepare(
-                "SELECT key_hash, name FROM api_keys WHERE revoked_at IS NULL"
-            ).map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare("SELECT key_hash, name FROM api_keys WHERE revoked_at IS NULL")
+                .map_err(|e| e.to_string())?;
 
             let keys: Vec<(String, String)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -285,11 +286,14 @@ impl ApiKeyManager {
 
         if let Some((bcrypt_hash, name)) = result {
             // Cache the valid key (by hash, not plaintext)
-            self.cache.insert(cache_key, CachedKey {
-                bcrypt_hash: bcrypt_hash.clone(),
-                name: name.clone(),
-                cached_at: Instant::now(),
-            });
+            self.cache.insert(
+                cache_key,
+                CachedKey {
+                    bcrypt_hash: bcrypt_hash.clone(),
+                    name: name.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
 
             // Mark for background update (keyed by bcrypt hash)
             self.mark_key_used(&bcrypt_hash);
@@ -335,9 +339,9 @@ impl ApiKeyManager {
             let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
 
             // Get all non-revoked key hashes
-            let mut stmt = conn.prepare(
-                "SELECT key_hash, name FROM api_keys WHERE revoked_at IS NULL"
-            ).map_err(|e| e.to_string())?;
+            let mut stmt = conn
+                .prepare("SELECT key_hash, name FROM api_keys WHERE revoked_at IS NULL")
+                .map_err(|e| e.to_string())?;
 
             let keys: Vec<(String, String)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -359,11 +363,14 @@ impl ApiKeyManager {
 
         if let Some((bcrypt_hash, name)) = result {
             // Cache the valid key (by hash, not plaintext)
-            self.cache.insert(cache_key, CachedKey {
-                bcrypt_hash: bcrypt_hash.clone(),
-                name: name.clone(),
-                cached_at: Instant::now(),
-            });
+            self.cache.insert(
+                cache_key,
+                CachedKey {
+                    bcrypt_hash: bcrypt_hash.clone(),
+                    name: name.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
 
             // Mark for background update (keyed by bcrypt hash)
             self.mark_key_used(&bcrypt_hash);
@@ -453,7 +460,8 @@ impl ApiKeyManager {
     ///
     /// Takes the bcrypt hash (not plaintext) to avoid storing sensitive data.
     fn mark_key_used(&self, bcrypt_hash: &str) {
-        self.pending_updates.insert(bcrypt_hash.to_string(), Instant::now());
+        self.pending_updates
+            .insert(bcrypt_hash.to_string(), Instant::now());
     }
 
     /// Flush pending last_used_at updates to the database
@@ -468,7 +476,8 @@ impl ApiKeyManager {
         }
 
         // Collect bcrypt hashes to update (already the keys in pending_updates)
-        let updates: Vec<String> = self.pending_updates
+        let updates: Vec<String> = self
+            .pending_updates
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
@@ -488,7 +497,8 @@ impl ApiKeyManager {
                 tx.execute(
                     "UPDATE api_keys SET last_used_at = datetime('now') WHERE key_hash = ?1",
                     rusqlite::params![key_hash],
-                ).map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
             }
 
             tx.commit().map_err(|e| e.to_string())?;
@@ -548,9 +558,7 @@ pub async fn api_key_identity_middleware(
             Ok(Some(info)) => {
                 // Key is valid - attach identity to request extensions
                 #[cfg(feature = "rate-limiting")]
-                req.extensions_mut().insert(ApiKeyId {
-                    id: info.key_hash,
-                });
+                req.extensions_mut().insert(ApiKeyId { id: info.key_hash });
                 debug!(name = %info.name, "Authenticated API key");
             }
             Ok(None) => {
@@ -639,8 +647,8 @@ pub async fn api_key_required_middleware(
 /// Extract API key from request
 ///
 /// Checks (in order):
-/// 1. Authorization header: "Bearer <token>"
-/// 2. Query parameter: ?api_key=<token>
+/// 1. Authorization header: "Bearer TOKEN"
+/// 2. Query parameter: ?api_key=TOKEN
 #[allow(dead_code)]
 fn extract_api_key(req: &axum::extract::Request) -> Option<String> {
     // Check Authorization header
@@ -833,8 +841,16 @@ mod tests {
         assert!(revoked);
 
         // CRITICAL: Verify cache and pending updates were cleared
-        assert_eq!(manager.cache.len(), 0, "Cache should be cleared after revoke");
-        assert_eq!(manager.pending_updates.len(), 0, "Pending updates should be cleared after revoke");
+        assert_eq!(
+            manager.cache.len(),
+            0,
+            "Cache should be cleared after revoke"
+        );
+        assert_eq!(
+            manager.pending_updates.len(),
+            0,
+            "Pending updates should be cleared after revoke"
+        );
 
         // Validation should now fail (cache miss + DB check)
         let is_valid = manager.validate_key(&plaintext).await.unwrap();
@@ -866,12 +882,21 @@ mod tests {
         assert!(!info.key_hash.is_empty());
 
         // Test 2: Invalid key should NOT return identity info
-        let invalid_info = manager.validate_key_with_info("mf_invalid_key_12345").await.unwrap();
-        assert!(invalid_info.is_none(), "Invalid key should NOT return identity info");
+        let invalid_info = manager
+            .validate_key_with_info("mf_invalid_key_12345")
+            .await
+            .unwrap();
+        assert!(
+            invalid_info.is_none(),
+            "Invalid key should NOT return identity info"
+        );
 
         // Test 3: Empty key should NOT return identity info
         let empty_info = manager.validate_key_with_info("").await.unwrap();
-        assert!(empty_info.is_none(), "Empty key should NOT return identity info");
+        assert!(
+            empty_info.is_none(),
+            "Empty key should NOT return identity info"
+        );
 
         // SECURITY IMPLICATION:
         // The middleware uses validate_key_with_info() to decide whether to attach

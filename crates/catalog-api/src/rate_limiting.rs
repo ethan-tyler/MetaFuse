@@ -296,7 +296,9 @@ impl RateLimiter {
 
         // Check if limit exceeded
         if bucket.count >= limit {
-            let retry_after = self.config.window_secs
+            let retry_after = self
+                .config
+                .window_secs
                 .saturating_sub(now.duration_since(bucket.window_start).as_secs());
             warn!(
                 key = %key,
@@ -439,10 +441,15 @@ mod tests {
             .header("x-forwarded-for", "203.0.113.1")
             .body(())
             .unwrap();
-        trusted_req.extensions_mut().insert(ConnectInfo(trusted_addr));
+        trusted_req
+            .extensions_mut()
+            .insert(ConnectInfo(trusted_addr));
 
         let (key, _) = limiter.get_rate_limit_key(&trusted_req);
-        assert_eq!(key, "anon:203.0.113.1", "Should use X-Forwarded-For from trusted proxy");
+        assert_eq!(
+            key, "anon:203.0.113.1",
+            "Should use X-Forwarded-For from trusted proxy"
+        );
 
         // Request from untrusted proxy with X-Forwarded-For
         let untrusted_addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
@@ -450,10 +457,15 @@ mod tests {
             .header("x-forwarded-for", "203.0.113.1")
             .body(())
             .unwrap();
-        untrusted_req.extensions_mut().insert(ConnectInfo(untrusted_addr));
+        untrusted_req
+            .extensions_mut()
+            .insert(ConnectInfo(untrusted_addr));
 
         let (key, _) = limiter.get_rate_limit_key(&untrusted_req);
-        assert_eq!(key, "anon:192.168.1.1", "Should ignore X-Forwarded-For from untrusted source");
+        assert_eq!(
+            key, "anon:192.168.1.1",
+            "Should ignore X-Forwarded-For from untrusted source"
+        );
     }
 
     #[test]
@@ -483,13 +495,18 @@ mod tests {
         for mut entry in limiter.buckets.iter_mut() {
             let bucket = entry.value_mut();
             // Set last_accessed to be older than TTL
-            bucket.last_accessed = Instant::now() - Duration::from_secs(DEFAULT_BUCKET_TTL_SECS + 1);
+            bucket.last_accessed =
+                Instant::now() - Duration::from_secs(DEFAULT_BUCKET_TTL_SECS + 1);
         }
 
         // Trigger cleanup
         limiter.cleanup_old_buckets();
 
-        assert_eq!(limiter.buckets.len(), 0, "All old buckets should be evicted");
+        assert_eq!(
+            limiter.buckets.len(),
+            0,
+            "All old buckets should be evicted"
+        );
     }
 
     #[test]
@@ -513,7 +530,11 @@ mod tests {
 
         // Cleanup should not remove recently accessed bucket
         limiter.cleanup_old_buckets();
-        assert_eq!(limiter.buckets.len(), 1, "Active bucket should not be evicted");
+        assert_eq!(
+            limiter.buckets.len(),
+            1,
+            "Active bucket should not be evicted"
+        );
     }
 
     #[test]
@@ -533,10 +554,15 @@ mod tests {
             .header("x-forwarded-for", "203.0.113.1")
             .body(())
             .unwrap();
-        trusted_req.extensions_mut().insert(ConnectInfo(trusted_addr));
+        trusted_req
+            .extensions_mut()
+            .insert(ConnectInfo(trusted_addr));
 
         let (key, _) = limiter.get_rate_limit_key(&trusted_req);
-        assert_eq!(key, "anon:203.0.113.1", "Should use X-Forwarded-For from trusted IPv6 proxy");
+        assert_eq!(
+            key, "anon:203.0.113.1",
+            "Should use X-Forwarded-For from trusted IPv6 proxy"
+        );
     }
 
     #[test]
@@ -556,10 +582,15 @@ mod tests {
             .header("x-real-ip", "203.0.113.1")
             .body(())
             .unwrap();
-        untrusted_req.extensions_mut().insert(ConnectInfo(untrusted_addr));
+        untrusted_req
+            .extensions_mut()
+            .insert(ConnectInfo(untrusted_addr));
 
         let (key, _) = limiter.get_rate_limit_key(&untrusted_req);
-        assert_eq!(key, "anon:192.168.1.1", "Should ignore X-Real-IP from untrusted source");
+        assert_eq!(
+            key, "anon:192.168.1.1",
+            "Should ignore X-Real-IP from untrusted source"
+        );
     }
 
     #[test]
@@ -570,7 +601,7 @@ mod tests {
             authenticated_limit: 1000,
             window_secs: 60,
             trusted_proxies: None,
-            max_buckets: 20,  // Small cap for testing
+            max_buckets: 20, // Small cap for testing
             bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
         });
 
@@ -586,7 +617,8 @@ mod tests {
 
         // Mark all existing buckets as stale
         for mut entry in limiter.buckets.iter_mut() {
-            entry.value_mut().last_accessed = Instant::now() - Duration::from_secs(DEFAULT_BUCKET_TTL_SECS + 1);
+            entry.value_mut().last_accessed =
+                Instant::now() - Duration::from_secs(DEFAULT_BUCKET_TTL_SECS + 1);
         }
 
         // Create the 11th bucket (threshold is max_buckets/2 = 10)
@@ -605,7 +637,11 @@ mod tests {
         assert!(limiter.check_rate_limit(&req2).is_ok());
 
         // After cleanup, should only have the 2 fresh buckets (11 and 12)
-        assert_eq!(limiter.buckets.len(), 2, "Old buckets should be evicted when cap threshold reached");
+        assert_eq!(
+            limiter.buckets.len(),
+            2,
+            "Old buckets should be evicted when cap threshold reached"
+        );
     }
 
     #[test]
