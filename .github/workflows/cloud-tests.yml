@@ -121,11 +121,12 @@ jobs:
           done
 
           # Create test bucket using mc (MinIO client)
+          # Note: Tests use 'test-bucket' as the bucket name
           docker run --rm \
             --network host \
             --entrypoint /bin/sh \
             minio/mc:latest \
-            -c "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/test-bucket-${{ github.run_id }} || true"
+            -c "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/test-bucket || true"
 
       - name: Run cloud tests (${{ matrix.backend.name }})
         if: steps.docker_check.outputs.skip != 'true'

@@ -41,7 +41,8 @@ mod tests {
             eprintln!("skipping {name}: Docker not available");
             return None;
         }
-        Some(env_lock().lock().expect("failed to lock test mutex"))
+        // Use unwrap_or_else to recover from poisoned mutex (if a previous test panicked)
+        Some(env_lock().lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn docker_available() -> bool {
@@ -154,14 +155,14 @@ mod tests {
     /// Create bucket using MinIO mc client (faster than aws-cli)
     fn create_bucket_if_not_exists(port: u16, bucket_name: &str) {
         // Use minio/mc which is lighter and faster than amazon/aws-cli
-        let _ = Command::new("docker")
+        let output = Command::new("docker")
             .args([
                 "run",
                 "--rm",
                 "--network=host",
                 "--entrypoint",
                 "/bin/sh",
-                "minio/mc",
+                "minio/mc:latest",
                 "-c",
                 &format!(
                     "mc alias set local http://127.0.0.1:{} minioadmin minioadmin && mc mb local/{} 2>/dev/null || true",
@@ -169,6 +170,24 @@ mod tests {
                 ),
             ])
             .output();
+
+        match output {
+            Ok(o) => {
+                if !o.status.success() {
+                    eprintln!(
+                        "Bucket creation command exited with {}: {}",
+                        o.status,
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                }
+            }
+            Err(e) => eprintln!("Failed to run bucket creation command: {}", e),
+        }
+    }
+
+    /// Generate unique object key for each test to avoid conflicts
+    fn unique_object_key(test_name: &str) -> String {
+        format!("{}-{}.db", test_name, std::process::id())
     }
 
     #[tokio::test]
@@ -178,7 +197,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("init");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize should succeed
         assert!(backend.initialize().await.is_ok());
@@ -205,7 +225,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("exists");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Should not exist initially
         assert_eq!(backend.exists().await.unwrap(), false);
@@ -232,7 +253,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("roundtrip");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
         backend.initialize().await.unwrap();
@@ -263,7 +285,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "nonexistent.db");
+        let object_key = unique_object_key("notfound");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Download non-existent catalog should fail gracefully
         let result = backend.download().await;
@@ -292,7 +315,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("conn");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
         backend.initialize().await.unwrap();
@@ -323,7 +347,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend1) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("concurrent");
+        let (_container, backend1) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
         backend1.initialize().await.unwrap();
@@ -342,7 +367,7 @@ mod tests {
         backend1.upload(&download1).await.unwrap();
 
         // Second backend with same bucket/object
-        let backend2 = S3Backend::new("test-bucket", "catalog.db", "us-east-1")
+        let backend2 = S3Backend::new("test-bucket", &object_key, "us-east-1")
             .expect("Failed to create backend2");
 
         // Second download gets new ETag
@@ -395,7 +420,8 @@ mod tests {
         // Explicitly disable cache
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "0");
 
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("cache");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
         backend.initialize().await.unwrap();
@@ -430,7 +456,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("retry");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
         backend.initialize().await.unwrap();
@@ -466,7 +493,8 @@ mod tests {
             None => return,
         };
         let docker = Cli::default();
-        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", "catalog.db");
+        let object_key = unique_object_key("metadata");
+        let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
         backend.initialize().await.unwrap();
