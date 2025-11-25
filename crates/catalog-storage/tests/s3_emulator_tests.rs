@@ -129,14 +129,17 @@ mod tests {
             (ContainerWrapper::Testcontainers(minio_container), port)
         };
 
-        // Configure AWS SDK to use MinIO
+        // Configure object_store AWS SDK to use MinIO
+        // Note: object_store uses AWS_ENDPOINT (not AWS_ENDPOINT_URL)
+        // and requires AWS_ALLOW_HTTP=true for non-HTTPS endpoints
         std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
         std::env::set_var("AWS_REGION", "us-east-1");
         std::env::set_var(
-            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT",
             format!("http://localhost:{}", minio_port),
         );
+        std::env::set_var("AWS_ALLOW_HTTP", "true");
 
         // Disable caching for tests
         std::env::set_var("METAFUSE_CACHE_TTL_SECS", "0");
@@ -193,7 +196,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -219,7 +223,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -249,7 +254,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -277,7 +283,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -307,7 +314,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -374,7 +382,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -412,7 +421,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -447,7 +457,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 
@@ -488,7 +499,8 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
         std::env::remove_var("AWS_REGION");
-        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ENDPOINT");
+        std::env::remove_var("AWS_ALLOW_HTTP");
         std::env::remove_var("METAFUSE_CACHE_TTL_SECS");
     }
 }
