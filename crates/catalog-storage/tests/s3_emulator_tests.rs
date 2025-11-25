@@ -135,10 +135,7 @@ mod tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
         std::env::set_var("AWS_REGION", "us-east-1");
-        std::env::set_var(
-            "AWS_ENDPOINT",
-            format!("http://localhost:{}", minio_port),
-        );
+        std::env::set_var("AWS_ENDPOINT", format!("http://localhost:{}", minio_port));
         std::env::set_var("AWS_ALLOW_HTTP", "true");
 
         // Disable caching for tests
