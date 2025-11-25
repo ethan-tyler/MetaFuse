@@ -17,6 +17,21 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use testcontainers::{clients::Cli, core::WaitFor, GenericImage};
+    use tokio::time::timeout;
+
+    /// Default timeout for async operations to prevent indefinite hangs
+    const OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Wrap an async operation with a timeout to prevent indefinite hangs in CI
+    async fn with_timeout<T, F>(fut: F, ctx: &str) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match timeout(OP_TIMEOUT, fut).await {
+            Ok(v) => v,
+            Err(_) => panic!("timed out after {:?} while {}", OP_TIMEOUT, ctx),
+        }
+    }
 
     // Serialize tests to avoid env var collisions and emulator port reuse.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -34,7 +49,8 @@ mod tests {
             eprintln!("skipping {name}: Docker not available");
             return None;
         }
-        Some(env_lock().lock().expect("failed to lock test mutex"))
+        // Use unwrap_or_else to recover from poisoned mutex (if a previous test panicked)
+        Some(env_lock().lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn docker_available() -> bool {
@@ -107,11 +123,13 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize should succeed
-        assert!(backend.initialize().await.is_ok());
+        assert!(with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .is_ok());
 
         // Second initialize should fail (already exists)
         assert!(matches!(
-            backend.initialize().await,
+            with_timeout(backend.initialize(), "backend.initialize() second").await,
             Err(CatalogError::Other(_))
         ));
 
@@ -130,13 +148,25 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Should not exist initially
-        assert_eq!(backend.exists().await.unwrap(), false);
+        assert_eq!(
+            with_timeout(backend.exists(), "backend.exists()")
+                .await
+                .unwrap(),
+            false
+        );
 
         // Initialize
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Should exist now
-        assert_eq!(backend.exists().await.unwrap(), true);
+        assert_eq!(
+            with_timeout(backend.exists(), "backend.exists() after init")
+                .await
+                .unwrap(),
+            true
+        );
 
         // Cleanup
         std::env::remove_var("STORAGE_EMULATOR_HOST");
@@ -153,10 +183,14 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Download catalog
-        let download = backend.download().await.unwrap();
+        let download = with_timeout(backend.download(), "backend.download()")
+            .await
+            .unwrap();
         assert!(download.path.exists());
         assert_eq!(download.catalog_version, 1);
         assert!(download.remote_version.is_some());
@@ -180,7 +214,7 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "nonexistent.db");
 
         // Download non-existent catalog should fail gracefully
-        let result = backend.download().await;
+        let result = with_timeout(backend.download(), "backend.download() not found").await;
         assert!(result.is_err());
 
         match result {
@@ -205,10 +239,14 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Get connection should succeed
-        let conn = backend.get_connection().await.unwrap();
+        let conn = with_timeout(backend.get_connection(), "backend.get_connection()")
+            .await
+            .unwrap();
 
         // Verify schema is initialized
         let mut stmt = conn
@@ -232,10 +270,14 @@ mod tests {
         let (_container, backend1) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend1.initialize().await.unwrap();
+        with_timeout(backend1.initialize(), "backend1.initialize()")
+            .await
+            .unwrap();
 
         // First download
-        let download1 = backend1.download().await.unwrap();
+        let download1 = with_timeout(backend1.download(), "backend1.download()")
+            .await
+            .unwrap();
         let generation1 = download1
             .remote_version
             .as_ref()
@@ -244,15 +286,32 @@ mod tests {
             .clone()
             .unwrap();
 
-        // Simulate concurrent modification: upload to increment generation
-        backend1.upload(&download1).await.unwrap();
+        // Modify the downloaded DB to force different bytes (and thus different generation after upload)
+        {
+            let conn_mod = rusqlite::Connection::open(&download1.path).unwrap();
+            let _ = conn_mod.execute(
+                "CREATE TABLE IF NOT EXISTS _test_marker (k TEXT PRIMARY KEY, v TEXT);",
+                [],
+            );
+            let _ = conn_mod.execute(
+                "INSERT OR REPLACE INTO _test_marker (k, v) VALUES (?1, ?2)",
+                rusqlite::params!["marker", "1"],
+            );
+        }
+
+        // Upload modified DB - this will produce a new generation
+        with_timeout(backend1.upload(&download1), "backend1.upload()")
+            .await
+            .unwrap();
 
         // Second backend with same bucket/object
         let backend2 =
             GcsBackend::new("test-bucket", "catalog.db").expect("Failed to create backend2");
 
         // Second download gets new generation
-        let download2 = backend2.download().await.unwrap();
+        let download2 = with_timeout(backend2.download(), "backend2.download()")
+            .await
+            .unwrap();
         let generation2 = download2
             .remote_version
             .as_ref()
@@ -268,7 +327,7 @@ mod tests {
         );
 
         // Try to upload with stale generation (download1)
-        let result = backend1.upload(&download1).await;
+        let result = with_timeout(backend1.upload(&download1), "backend1.upload() stale").await;
 
         // Should fail with conflict error (after retries exhausted)
         assert!(
@@ -306,14 +365,20 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // First download
-        let download1 = backend.download().await.unwrap();
+        let download1 = with_timeout(backend.download(), "backend.download() first")
+            .await
+            .unwrap();
         let path1 = download1.path.clone();
 
         // Second download (cache disabled, should get new temp file)
-        let download2 = backend.download().await.unwrap();
+        let download2 = with_timeout(backend.download(), "backend.download() second")
+            .await
+            .unwrap();
         let path2 = download2.path.clone();
 
         // Paths should be different (no caching)
@@ -337,18 +402,53 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Download to get initial state
-        let download = backend.download().await.unwrap();
+        let download = with_timeout(backend.download(), "backend.download()")
+            .await
+            .unwrap();
+
+        // Modify the downloaded DB to force different bytes
+        {
+            let conn_mod = rusqlite::Connection::open(&download.path).unwrap();
+            let _ = conn_mod.execute(
+                "CREATE TABLE IF NOT EXISTS _test_marker (k TEXT PRIMARY KEY, v TEXT);",
+                [],
+            );
+            let _ = conn_mod.execute(
+                "INSERT OR REPLACE INTO _test_marker (k, v) VALUES (?1, ?2)",
+                rusqlite::params!["marker", "1"],
+            );
+        }
 
         // First upload should succeed
-        let result = backend.upload(&download).await;
+        let result = with_timeout(backend.upload(&download), "backend.upload() first").await;
         assert!(result.is_ok(), "First upload should succeed");
 
-        // Second upload with same (now stale) download should trigger retries
-        // After 3 retries with exponential backoff, it should fail
-        let result = backend.upload(&download).await;
+        // Simulate external concurrent modification
+        let external = with_timeout(backend.download(), "backend.download() external")
+            .await
+            .unwrap();
+        {
+            let conn_ext = rusqlite::Connection::open(&external.path).unwrap();
+            let _ = conn_ext.execute(
+                "CREATE TABLE IF NOT EXISTS _ext_marker (k TEXT PRIMARY KEY, v TEXT);",
+                [],
+            );
+            let _ = conn_ext.execute(
+                "INSERT OR REPLACE INTO _ext_marker (k, v) VALUES (?1, ?2)",
+                rusqlite::params!["ext", "1"],
+            );
+        }
+        with_timeout(backend.upload(&external), "backend.upload() external")
+            .await
+            .expect("external upload should succeed");
+
+        // Now the original `download` is stale - upload should fail after retries
+        let result = with_timeout(backend.upload(&download), "backend.upload() stale").await;
         assert!(
             result.is_err(),
             "Upload with stale version should fail after retries"
@@ -369,19 +469,35 @@ mod tests {
         let (_container, backend) = setup_gcs_backend(&docker, "test-bucket", "catalog.db");
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
-        // Get connection and insert test data
-        let conn = backend.get_connection().await.unwrap();
-        conn.execute(
-            "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES (?, ?, ?, datetime('now'), datetime('now'))",
-            rusqlite::params!["test_dataset", "gs://bucket/data.parquet", "parquet"],
-        )
-        .unwrap();
+        // Download current remote DB
+        let download = with_timeout(backend.download(), "backend.download()")
+            .await
+            .unwrap();
 
-        // Download should include the inserted data
-        let download = backend.download().await.unwrap();
-        let conn2 = rusqlite::Connection::open(&download.path).unwrap();
+        // Modify the downloaded DB (insert test data)
+        {
+            let conn = rusqlite::Connection::open(&download.path).unwrap();
+            conn.execute(
+                "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+                rusqlite::params!["test_dataset", "gs://bucket/data.parquet", "parquet"],
+            )
+            .unwrap();
+        }
+
+        // Upload modified DB to GCS
+        with_timeout(backend.upload(&download), "backend.upload()")
+            .await
+            .unwrap();
+
+        // Download again and verify the inserted data persisted
+        let download2 = with_timeout(backend.download(), "backend.download() verify")
+            .await
+            .unwrap();
+        let conn2 = rusqlite::Connection::open(&download2.path).unwrap();
 
         let mut stmt = conn2.prepare("SELECT name FROM datasets").unwrap();
         let names: Vec<String> = stmt

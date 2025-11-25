@@ -22,7 +22,7 @@ jobs:
   cloud-emulator-tests:
     name: Cloud Backend Tests (${{ matrix.backend }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     continue-on-error: true
 
     # Skip on external forks (Docker service containers not available)
@@ -130,7 +130,7 @@ jobs:
 
       - name: Run cloud tests (${{ matrix.backend.name }})
         if: steps.docker_check.outputs.skip != 'true'
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           RUN_CLOUD_TESTS: 1
           RUST_TEST_THREADS: 1

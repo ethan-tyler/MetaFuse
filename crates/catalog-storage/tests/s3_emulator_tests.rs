@@ -21,6 +21,21 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use testcontainers::{clients::Cli, core::WaitFor, GenericImage};
+    use tokio::time::timeout;
+
+    /// Default timeout for async operations to prevent indefinite hangs
+    const OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Wrap an async operation with a timeout to prevent indefinite hangs in CI
+    async fn with_timeout<T, F>(fut: F, ctx: &str) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        match timeout(OP_TIMEOUT, fut).await {
+            Ok(v) => v,
+            Err(_) => panic!("timed out after {:?} while {}", OP_TIMEOUT, ctx),
+        }
+    }
 
     // Serialize tests to avoid env var collisions and emulator port reuse.
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -201,11 +216,13 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize should succeed
-        assert!(backend.initialize().await.is_ok());
+        assert!(with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .is_ok());
 
         // Second initialize should fail (already exists)
         assert!(matches!(
-            backend.initialize().await,
+            with_timeout(backend.initialize(), "backend.initialize() second").await,
             Err(CatalogError::Other(_))
         ));
 
@@ -229,13 +246,25 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Should not exist initially
-        assert_eq!(backend.exists().await.unwrap(), false);
+        assert_eq!(
+            with_timeout(backend.exists(), "backend.exists()")
+                .await
+                .unwrap(),
+            false
+        );
 
         // Initialize
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Should exist now
-        assert_eq!(backend.exists().await.unwrap(), true);
+        assert_eq!(
+            with_timeout(backend.exists(), "backend.exists() after init")
+                .await
+                .unwrap(),
+            true
+        );
 
         // Cleanup
         std::env::remove_var("AWS_ACCESS_KEY_ID");
@@ -257,10 +286,14 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Download catalog
-        let download = backend.download().await.unwrap();
+        let download = with_timeout(backend.download(), "backend.download()")
+            .await
+            .unwrap();
         assert!(download.path.exists());
         assert_eq!(download.catalog_version, 1);
         assert!(download.remote_version.is_some());
@@ -289,7 +322,7 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Download non-existent catalog should fail gracefully
-        let result = backend.download().await;
+        let result = with_timeout(backend.download(), "backend.download() not found").await;
         assert!(result.is_err());
 
         match result {
@@ -319,10 +352,14 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Get connection should succeed
-        let conn = backend.get_connection().await.unwrap();
+        let conn = with_timeout(backend.get_connection(), "backend.get_connection()")
+            .await
+            .unwrap();
 
         // Verify schema is initialized
         let mut stmt = conn
@@ -351,10 +388,14 @@ mod tests {
         let (_container, backend1) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
-        backend1.initialize().await.unwrap();
+        with_timeout(backend1.initialize(), "backend1.initialize()")
+            .await
+            .unwrap();
 
         // First download
-        let download1 = backend1.download().await.unwrap();
+        let download1 = with_timeout(backend1.download(), "backend1.download()")
+            .await
+            .unwrap();
         let etag1 = download1
             .remote_version
             .as_ref()
@@ -382,14 +423,18 @@ mod tests {
         }
 
         // Upload the modified DB to simulate a concurrent writer (this changes the ETag)
-        backend1.upload(&download1).await.unwrap();
+        with_timeout(backend1.upload(&download1), "backend1.upload()")
+            .await
+            .unwrap();
 
         // Second backend with same bucket/object
         let backend2 = S3Backend::new("test-bucket", &object_key, "us-east-1")
             .expect("Failed to create backend2");
 
         // Second download gets new ETag
-        let download2 = backend2.download().await.unwrap();
+        let download2 = with_timeout(backend2.download(), "backend2.download()")
+            .await
+            .unwrap();
         let etag2 = download2
             .remote_version
             .as_ref()
@@ -402,7 +447,7 @@ mod tests {
         assert_ne!(etag1, etag2, "ETags should differ after upload");
 
         // Try to upload with stale ETag (download1)
-        let result = backend1.upload(&download1).await;
+        let result = with_timeout(backend1.upload(&download1), "backend1.upload() stale").await;
 
         // Should fail with conflict error (after retries exhausted)
         assert!(result.is_err(), "Expected upload with stale ETag to fail");
@@ -442,14 +487,20 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // First download
-        let download1 = backend.download().await.unwrap();
+        let download1 = with_timeout(backend.download(), "backend.download() first")
+            .await
+            .unwrap();
         let path1 = download1.path.clone();
 
         // Second download (cache disabled, should get new temp file)
-        let download2 = backend.download().await.unwrap();
+        let download2 = with_timeout(backend.download(), "backend.download() second")
+            .await
+            .unwrap();
         let path2 = download2.path.clone();
 
         // Paths should be different (no caching)
@@ -478,10 +529,14 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Download to get initial state
-        let download = backend.download().await.unwrap();
+        let download = with_timeout(backend.download(), "backend.download()")
+            .await
+            .unwrap();
 
         // Modify the download so upload actually changes the content
         {
@@ -499,12 +554,14 @@ mod tests {
         }
 
         // First upload should succeed
-        let result = backend.upload(&download).await;
+        let result = with_timeout(backend.upload(&download), "backend.upload()").await;
         assert!(result.is_ok(), "First upload should succeed");
 
         // Simulate an external concurrent modification to make `download` stale:
         // Download current remote, modify it, upload it (this changes ETag on server)
-        let external = backend.download().await.unwrap();
+        let external = with_timeout(backend.download(), "backend.download() external")
+            .await
+            .unwrap();
         {
             let conn_ext = rusqlite::Connection::open(&external.path).unwrap();
             conn_ext
@@ -520,13 +577,12 @@ mod tests {
                 )
                 .unwrap();
         }
-        backend
-            .upload(&external)
+        with_timeout(backend.upload(&external), "backend.upload() external")
             .await
             .expect("external upload should succeed");
 
         // Now attempt the stale upload (original `download`) which should trigger retries and fail
-        let result = backend.upload(&download).await;
+        let result = with_timeout(backend.upload(&download), "backend.upload() stale").await;
         assert!(
             result.is_err(),
             "Upload with stale version should fail after retries"
@@ -552,11 +608,15 @@ mod tests {
         let (_container, backend) = setup_s3_backend(&docker, "test-bucket", &object_key);
 
         // Initialize catalog
-        backend.initialize().await.unwrap();
+        with_timeout(backend.initialize(), "backend.initialize()")
+            .await
+            .unwrap();
 
         // Download the current remote DB, modify it locally, then upload
         // Note: get_connection() returns a local temp file - changes don't auto-sync to S3
-        let download = backend.download().await.unwrap();
+        let download = with_timeout(backend.download(), "backend.download()")
+            .await
+            .unwrap();
 
         // Modify the downloaded DB to insert the fake dataset
         {
@@ -569,10 +629,14 @@ mod tests {
         }
 
         // Upload the modified DB so the remote object contains the inserted row
-        backend.upload(&download).await.unwrap();
+        with_timeout(backend.upload(&download), "backend.upload()")
+            .await
+            .unwrap();
 
         // Now download again and verify the inserted data is preserved
-        let download2 = backend.download().await.unwrap();
+        let download2 = with_timeout(backend.download(), "backend.download() verify")
+            .await
+            .unwrap();
         let conn2 = rusqlite::Connection::open(&download2.path).unwrap();
 
         let mut stmt = conn2.prepare("SELECT name FROM datasets").unwrap();
