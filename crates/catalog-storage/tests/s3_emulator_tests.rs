@@ -502,8 +502,8 @@ mod tests {
         // Insert fake dataset to verify preservation
         let conn = backend.get_connection().await.unwrap();
         conn.execute(
-            "INSERT INTO datasets (name, format, uri, catalog_version) VALUES (?, ?, ?, ?)",
-            rusqlite::params!["test_dataset", "parquet", "s3://bucket/data.parquet", 1],
+            "INSERT INTO datasets (name, path, format, created_at, last_updated) VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+            rusqlite::params!["test_dataset", "s3://bucket/data.parquet", "parquet"],
         )
         .unwrap();
 

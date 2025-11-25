@@ -502,7 +502,10 @@ impl CatalogBackend for GcsBackend {
             .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
             // Persist temp file (keep it alive for subsequent operations)
-            let temp_path = temp_file.into_temp_path().to_path_buf();
+            let temp_path = temp_file
+                .into_temp_path()
+                .keep()
+                .map_err(|e| CatalogError::Other(format!("Failed to persist temp file: {}", e)))?;
 
             let download = CatalogDownload {
                 path: temp_path,
@@ -884,7 +887,10 @@ impl CatalogBackend for S3Backend {
             .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
             // Persist temp file (keep it alive for subsequent operations)
-            let temp_path = temp_file.into_temp_path().to_path_buf();
+            let temp_path = temp_file
+                .into_temp_path()
+                .keep()
+                .map_err(|e| CatalogError::Other(format!("Failed to persist temp file: {}", e)))?;
 
             let download = CatalogDownload {
                 path: temp_path,
