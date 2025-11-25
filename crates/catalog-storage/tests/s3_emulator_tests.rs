@@ -70,14 +70,20 @@ mod tests {
         bucket_name: &str,
         object_key: &str,
     ) -> (impl Drop + 'a, S3Backend) {
-        // Start MinIO container
+        // Start MinIO container with `server /data` command
+        // MinIO requires this command to start the S3-compatible server
+        // In testcontainers 0.15, command args are passed as a tuple (image, args)
         let minio_image = GenericImage::new("minio/minio", "latest")
             .with_exposed_port(9000)
             .with_env_var("MINIO_ROOT_USER", "minioadmin")
             .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
             .with_wait_for(WaitFor::message_on_stdout("API:"));
 
-        let minio_container = docker.run(minio_image);
+        // Pass command arguments via tuple: (image, Vec<String>)
+        // GenericImage::Args = Vec<String>
+        let args: Vec<String> = vec!["server".to_string(), "/data".to_string()];
+
+        let minio_container = docker.run((minio_image, args));
         let minio_port = minio_container.get_host_port_ipv4(9000);
 
         // Wait for readiness
