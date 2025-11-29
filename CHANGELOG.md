@@ -7,43 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### v0.5.0 - Production Hardening & Legacy Removal
+### v0.5.0 - CI Enhancement & Cloud Testing
 
-#### BREAKING CHANGES
-
-- **Removed `legacy-sync` feature flag**: The synchronous API adapter has been removed.
-  All code must use async/await APIs introduced in v0.4.0.
-  - If you're on v0.4.x with async APIs: **No changes required**
-  - If you're using `SyncBackendAdapter`: See [MIGRATION-v0.5.md](docs/MIGRATION-v0.5.md) for upgrade path
-
-#### Removed
-
-- Deprecated `sync_adapter` module (`crates/catalog-storage/src/sync_adapter.rs`)
-- `legacy-sync` Cargo feature flag from `catalog-storage`
-- `legacy-sync` feature dependency in `catalog-cli`
-- Legacy v0.3.x code in `MetaFuse/` directory
+**No breaking changes** - this release focuses on CI infrastructure and testing improvements.
 
 #### Added
 
-- Cloud emulator tests in CI (GCS with fake-gcs-server, S3 with MinIO)
+- **Cloud Emulator Tests in CI**
+  - S3 tests with MinIO emulator (fully functional)
+  - GCS tests with fake-gcs-server (compile-validation only)
   - Gated behind `RUN_CLOUD_TESTS=1` environment variable
-  - Only runs on main repository (not forks)
-  - Serialized execution to prevent port conflicts
-- Cloud backend benchmarks (compile-only in PR CI)
-  - GCS and S3 upload/download performance benchmarks
-  - Cache hit vs miss performance testing
-- Security integration tests for rate limiting and API key authentication
-- Comprehensive v0.5.0 migration guide
+  - Only runs on main repository (not forks due to Docker limitations)
+  - Test isolation with unique object keys per test
 
-**Note**: Stress tests were initially planned but removed due to API incompatibility with v0.4 architecture. Performance and load testing will be addressed in a future release with proper integration using Emitter and CatalogBackend APIs.
+- **GCS Backend Emulator Support**
+  - `GcsBackend::new()` auto-detects `STORAGE_EMULATOR_HOST` environment variable
+  - Configures `gcs_base_url` and `disable_oauth` for local testing
+  - Enables testing without real GCP credentials
+
+#### Known Limitations
+
+- **GCS Emulator Tests Disabled**: GCS tests are marked `#[ignore]` due to XML API
+  incompatibility between `object_store` crate and `fake-gcs-server`:
+  - `object_store` uses XML API PUT for uploads (`PUT /<bucket>/<object>`)
+  - `fake-gcs-server` only supports JSON API for uploads
+  - Tracking: [fsouza/fake-gcs-server#331](https://github.com/fsouza/fake-gcs-server/issues/331)
+  - Tests will be re-enabled when fake-gcs-server adds XML API support
 
 #### Improved
 
-- CI safety: Docker availability checks, fork detection, timeouts
-- Documentation: Updated roadmap to reflect async completion
-- Test isolation: Emulator tests run in separate CI job
+- CI safety: Docker availability checks, fork detection, job timeouts
+- S3 test reliability: ETag-based concurrency detection, proper content modifications
+- Test isolation: Unique bucket/object keys per test run
+- Documentation: Removed outdated migration guides
 
-**Migration Guide**: [docs/MIGRATION-v0.5.md](docs/MIGRATION-v0.5.md)
+#### Removed
+
+- Duplicate migration files (consolidated to `docs/` directory)
 
 ---
 

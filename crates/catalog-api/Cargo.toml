@@ -16,10 +16,17 @@ default = []
 metrics = ["prometheus", "lazy_static"]
 rate-limiting = ["dashmap"]
 api-keys = ["bcrypt", "rand", "dashmap", "hex"]
+# Phase 3: Enterprise Features
+audit = []
+usage-analytics = ["dashmap"]
+classification = ["regex"]
+# Enterprise bundle
+enterprise = ["audit", "usage-analytics", "classification"]
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
 metafuse-catalog-storage = { path = "../catalog-storage" }
+metafuse-catalog-delta = { path = "../catalog-delta" }
 
 axum.workspace = true
 tokio.workspace = true
@@ -44,6 +51,9 @@ dashmap = { workspace = true, optional = true }
 bcrypt = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+
+# Optional: Classification (Phase 3)
+regex = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

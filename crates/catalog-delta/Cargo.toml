@@ -1,0 +1,39 @@
+[package]
+name = "metafuse-catalog-delta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Delta Lake integration for MetaFuse catalog - read schema, stats, and history from Delta tables"
+
+[dependencies]
+# Delta Lake
+deltalake = { workspace = true }
+
+# URL parsing
+url = "2"
+
+# Caching
+lru = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+deltalake = { workspace = true }

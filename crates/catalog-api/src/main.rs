@@ -11,20 +11,33 @@ mod rate_limiting;
 #[cfg(feature = "api-keys")]
 mod api_keys;
 
+#[cfg(feature = "audit")]
+mod audit;
+
+#[cfg(feature = "usage-analytics")]
+mod usage_analytics;
+
+mod quality;
+
+#[cfg(feature = "classification")]
+mod classification;
+
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use metafuse_catalog_core::validation;
+use metafuse_catalog_core::{migrations, validation};
+use metafuse_catalog_delta::DeltaReader;
 use metafuse_catalog_storage::{backend_from_uri, DynCatalogBackend};
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
@@ -37,12 +50,22 @@ struct RequestId(String);
 /// Application state shared across handlers
 struct AppState {
     backend: Arc<DynCatalogBackend>,
+    delta_reader: Arc<DeltaReader>,
+    #[cfg(feature = "audit")]
+    audit_logger: audit::AuditLogger,
+    #[cfg(feature = "usage-analytics")]
+    usage_tracker: Arc<usage_analytics::UsageTracker>,
 }
 
 impl Clone for AppState {
     fn clone(&self) -> Self {
         Self {
             backend: Arc::clone(&self.backend),
+            delta_reader: Arc::clone(&self.delta_reader),
+            #[cfg(feature = "audit")]
+            audit_logger: self.audit_logger.clone(),
+            #[cfg(feature = "usage-analytics")]
+            usage_tracker: Arc::clone(&self.usage_tracker),
         }
     }
 }
@@ -54,6 +77,8 @@ struct DatasetResponse {
     name: String,
     path: String,
     format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta_location: Option<String>,
     description: Option<String>,
     tenant: Option<String>,
     domain: Option<String>,
@@ -72,17 +97,6 @@ struct FieldResponse {
     description: Option<String>,
 }
 
-/// Dataset detail response with fields
-#[derive(Debug, Serialize, Deserialize)]
-struct DatasetDetailResponse {
-    #[serde(flatten)]
-    dataset: DatasetResponse,
-    fields: Vec<FieldResponse>,
-    tags: Vec<String>,
-    upstream_datasets: Vec<String>,
-    downstream_datasets: Vec<String>,
-}
-
 /// Operational metadata response
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct OperationalMetaResponse {
@@ -95,6 +109,379 @@ struct OperationalMetaResponse {
 struct ErrorResponse {
     error: String,
     request_id: String,
+}
+
+// =============================================================================
+// Request Types for Write Endpoints
+// =============================================================================
+
+/// Request to create a new dataset
+#[derive(Debug, Deserialize)]
+struct CreateDatasetRequest {
+    name: String,
+    path: String,
+    format: String,
+    delta_location: Option<String>,
+    description: Option<String>,
+    tenant: Option<String>,
+    domain: Option<String>,
+    owner: Option<String>,
+    tags: Option<Vec<String>>,
+    upstream_datasets: Option<Vec<String>>,
+}
+
+/// Request to update an existing dataset
+#[derive(Debug, Deserialize)]
+struct UpdateDatasetRequest {
+    path: Option<String>,
+    format: Option<String>,
+    delta_location: Option<String>,
+    description: Option<String>,
+    tenant: Option<String>,
+    domain: Option<String>,
+    owner: Option<String>,
+}
+
+/// Request to create a new owner
+#[derive(Debug, Deserialize)]
+struct CreateOwnerRequest {
+    owner_id: String,
+    name: String,
+    owner_type: Option<String>,
+    email: Option<String>,
+    slack_channel: Option<String>,
+    contact_info: Option<serde_json::Value>,
+}
+
+/// Request to update an existing owner
+#[derive(Debug, Deserialize)]
+struct UpdateOwnerRequest {
+    name: Option<String>,
+    owner_type: Option<String>,
+    email: Option<String>,
+    slack_channel: Option<String>,
+    contact_info: Option<serde_json::Value>,
+}
+
+/// Request to create a lineage edge
+#[derive(Debug, Deserialize)]
+struct CreateLineageEdgeRequest {
+    source_dataset: String,
+    target_dataset: String,
+}
+
+/// Request to create a governance rule
+#[derive(Debug, Deserialize)]
+struct CreateGovernanceRuleRequest {
+    name: String,
+    rule_type: String,
+    description: Option<String>,
+    config: serde_json::Value,
+    priority: Option<i32>,
+}
+
+/// Request to update a governance rule
+#[derive(Debug, Deserialize)]
+struct UpdateGovernanceRuleRequest {
+    name: Option<String>,
+    rule_type: Option<String>,
+    description: Option<String>,
+    config: Option<serde_json::Value>,
+    priority: Option<i32>,
+    is_active: Option<bool>,
+}
+
+/// Request to create a quality metric
+#[derive(Debug, Deserialize)]
+struct CreateQualityMetricRequest {
+    completeness_score: Option<f64>,
+    freshness_score: Option<f64>,
+    file_health_score: Option<f64>,
+    overall_score: Option<f64>,
+    row_count: Option<i64>,
+    file_count: Option<i64>,
+    size_bytes: Option<i64>,
+    details: Option<serde_json::Value>,
+}
+
+/// Request to set freshness configuration
+#[derive(Debug, Deserialize)]
+struct SetFreshnessConfigRequest {
+    expected_interval_secs: i64,
+    grace_period_secs: Option<i64>,
+    timezone: Option<String>,
+    cron_schedule: Option<String>,
+    alert_on_stale: Option<bool>,
+    alert_channels: Option<Vec<String>>,
+}
+
+/// Request to add tags to a dataset
+#[derive(Debug, Deserialize)]
+struct AddTagsRequest {
+    tags: Vec<String>,
+}
+
+/// Request to remove tags from a dataset
+#[derive(Debug, Deserialize)]
+struct RemoveTagsRequest {
+    tags: Vec<String>,
+}
+
+// =============================================================================
+// Response Types for New Endpoints
+// =============================================================================
+
+/// Owner response structure
+#[derive(Debug, Serialize)]
+struct OwnerResponse {
+    id: i64,
+    owner_id: String,
+    name: String,
+    owner_type: String,
+    email: Option<String>,
+    slack_channel: Option<String>,
+    contact_info: Option<serde_json::Value>,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Governance rule response structure
+#[derive(Debug, Serialize)]
+struct GovernanceRuleResponse {
+    id: i64,
+    name: String,
+    rule_type: String,
+    description: Option<String>,
+    config: serde_json::Value,
+    priority: i32,
+    is_active: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Quality metric response structure
+#[derive(Debug, Serialize)]
+struct QualityMetricResponse {
+    id: i64,
+    dataset_id: i64,
+    computed_at: String,
+    completeness_score: Option<f64>,
+    freshness_score: Option<f64>,
+    file_health_score: Option<f64>,
+    overall_score: Option<f64>,
+    row_count: Option<i64>,
+    file_count: Option<i64>,
+    size_bytes: Option<i64>,
+    details: Option<serde_json::Value>,
+}
+
+/// Freshness config response structure
+#[derive(Debug, Serialize)]
+struct FreshnessConfigResponse {
+    id: i64,
+    dataset_id: i64,
+    expected_interval_secs: i64,
+    grace_period_secs: i64,
+    timezone: String,
+    cron_schedule: Option<String>,
+    alert_on_stale: bool,
+    alert_channels: Option<Vec<String>>,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Lineage edge response
+#[derive(Debug, Serialize)]
+struct LineageEdgeResponse {
+    id: i64,
+    upstream_dataset_id: i64,
+    downstream_dataset_id: i64,
+    created_at: String,
+}
+
+// =============================================================================
+// Delta-Delegated Response Types
+// =============================================================================
+
+/// Schema response from Delta table
+#[derive(Debug, Serialize)]
+struct SchemaResponse {
+    dataset_name: String,
+    delta_version: i64,
+    schema: serde_json::Value,
+    partition_columns: Vec<String>,
+}
+
+/// Stats response from Delta table
+#[derive(Debug, Serialize)]
+struct StatsResponse {
+    dataset_name: String,
+    delta_version: i64,
+    row_count: i64,
+    size_bytes: i64,
+    num_files: i64,
+    last_modified: Option<String>,
+}
+
+/// History response from Delta table
+#[derive(Debug, Serialize)]
+struct HistoryResponse {
+    dataset_name: String,
+    versions: Vec<VersionInfo>,
+}
+
+/// Version info for history response
+#[derive(Debug, Serialize)]
+struct VersionInfo {
+    version: i64,
+    timestamp: String,
+    operation: String,
+    parameters: HashMap<String, String>,
+}
+
+// =============================================================================
+// Query Parameter Types
+// =============================================================================
+
+/// Query params for schema endpoint
+#[derive(Debug, Deserialize)]
+struct SchemaQueryParams {
+    version: Option<i64>,
+}
+
+/// Query params for history endpoint
+#[derive(Debug, Deserialize)]
+struct HistoryQueryParams {
+    limit: Option<usize>,
+}
+
+/// Query params for get_dataset endpoint with optional includes
+#[derive(Debug, Deserialize, Default)]
+struct DatasetQueryParams {
+    /// Comma-separated list of additional data to include: delta,quality,lineage
+    include: Option<String>,
+}
+
+/// Valid include values
+const VALID_INCLUDE_VALUES: &[&str] = &["delta", "quality", "lineage"];
+
+/// Parsed include options
+#[derive(Debug, Default)]
+struct IncludeOptions {
+    delta: bool,
+    quality: bool,
+    lineage: bool,
+}
+
+impl IncludeOptions {
+    /// Parse and validate include query parameter
+    ///
+    /// Returns an error if any unknown include values are provided.
+    /// Valid values: delta, quality, lineage
+    fn parse(include: &Option<String>) -> Result<Self, String> {
+        match include {
+            None => Ok(Self::default()),
+            Some(s) if s.trim().is_empty() => Ok(Self::default()),
+            Some(s) => {
+                let parts: Vec<String> = s.split(',').map(|p| p.trim().to_lowercase()).collect();
+
+                // Validate all values are known
+                let invalid: Vec<&String> = parts
+                    .iter()
+                    .filter(|p| !p.is_empty() && !VALID_INCLUDE_VALUES.contains(&p.as_str()))
+                    .collect();
+
+                if !invalid.is_empty() {
+                    return Err(format!(
+                        "Invalid include value(s): {}. Valid values: {}",
+                        invalid
+                            .iter()
+                            .map(|s| format!("'{}'", s))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        VALID_INCLUDE_VALUES.join(", ")
+                    ));
+                }
+
+                Ok(Self {
+                    delta: parts.iter().any(|p| p == "delta"),
+                    quality: parts.iter().any(|p| p == "quality"),
+                    lineage: parts.iter().any(|p| p == "lineage"),
+                })
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Extended Response Types for ?include support
+// =============================================================================
+
+/// Delta table info (from live Delta metadata)
+#[derive(Debug, Serialize)]
+struct DeltaInfo {
+    version: i64,
+    row_count: i64,
+    size_bytes: i64,
+    num_files: i64,
+    partition_columns: Vec<String>,
+    last_modified: Option<String>,
+}
+
+/// Quality metrics info (latest computed scores)
+#[derive(Debug, Serialize)]
+struct QualityInfo {
+    overall_score: Option<f64>,
+    completeness_score: Option<f64>,
+    freshness_score: Option<f64>,
+    file_health_score: Option<f64>,
+    last_computed: Option<String>,
+}
+
+/// Lineage info (upstream and downstream datasets)
+#[derive(Debug, Serialize)]
+struct LineageInfo {
+    upstream: Vec<String>,
+    downstream: Vec<String>,
+}
+
+/// Extended dataset detail response with optional includes
+#[derive(Debug, Serialize)]
+struct ExtendedDatasetResponse {
+    #[serde(flatten)]
+    dataset: DatasetResponse,
+    fields: Vec<FieldResponse>,
+    tags: Vec<String>,
+    upstream_datasets: Vec<String>,
+    downstream_datasets: Vec<String>,
+    /// Delta table metadata (optional, via ?include=delta)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta: Option<DeltaInfo>,
+    /// Quality metrics (optional, via ?include=quality)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<QualityInfo>,
+    /// Lineage info (optional, via ?include=lineage) - separate from upstream/downstream for structured access
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lineage: Option<LineageInfo>,
+}
+
+/// Pagination query params for list endpoints
+#[derive(Debug, Deserialize, Default)]
+struct PaginationParams {
+    /// Maximum number of items to return (default: 100, max: 1000)
+    limit: Option<usize>,
+    /// Number of items to skip (default: 0)
+    offset: Option<usize>,
+}
+
+impl PaginationParams {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(100).min(1000)
+    }
+
+    fn offset(&self) -> usize {
+        self.offset.unwrap_or(0)
+    }
 }
 
 #[tokio::main]
@@ -127,24 +514,160 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
-    let state = AppState {
-        backend: Arc::from(backend),
+    // Run migrations if enabled via environment variable
+    if std::env::var("METAFUSE_RUN_MIGRATIONS").unwrap_or_default() == "true" {
+        tracing::info!("Running schema migrations on startup...");
+        let conn = backend.get_connection().await.map_err(|e| {
+            tracing::error!("Failed to get connection for migrations: {}", e);
+            e
+        })?;
+        match migrations::run_migrations(&conn) {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!("Applied {} migrations", count);
+                } else {
+                    tracing::info!("No pending migrations");
+                }
+            }
+            Err(e) => {
+                tracing::error!("Migration failed: {}", e);
+                return Err(e.into());
+            }
+        }
+    }
+
+    // Create DeltaReader with configurable cache settings
+    let cache_ttl_secs = std::env::var("METAFUSE_DELTA_CACHE_TTL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300u64); // Default: 5 minutes
+    let delta_reader = Arc::new(DeltaReader::new(Duration::from_secs(cache_ttl_secs)));
+    tracing::info!(cache_ttl_secs, "Delta reader initialized");
+
+    let backend = Arc::from(backend);
+
+    // Initialize audit logger if feature enabled
+    #[cfg(feature = "audit")]
+    let audit_logger = {
+        let config = audit::AuditConfig::default();
+        let (logger, receiver) = audit::AuditLogger::new(&config);
+        // Start background worker
+        let backend_clone = Arc::clone(&backend);
+        tokio::spawn(async move {
+            audit::audit_writer_task(receiver, backend_clone, config).await;
+        });
+        tracing::info!("Audit logging enabled");
+        logger
     };
 
-    // Build router with conditional metrics endpoint
-    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
-    let mut app = Router::new()
+    // Initialize usage tracker if feature enabled
+    #[cfg(feature = "usage-analytics")]
+    let usage_tracker = {
+        let tracker = Arc::new(usage_analytics::UsageTracker::new_default());
+        // Start background flush worker
+        let tracker_clone = Arc::clone(&tracker);
+        let backend_clone = Arc::clone(&backend);
+        tokio::spawn(async move {
+            usage_analytics::usage_flush_task(tracker_clone, backend_clone).await;
+        });
+        tracing::info!("Usage analytics enabled");
+        tracker
+    };
+
+    let state = AppState {
+        backend,
+        delta_reader,
+        #[cfg(feature = "audit")]
+        audit_logger,
+        #[cfg(feature = "usage-analytics")]
+        usage_tracker,
+    };
+
+    // Build router with conditional feature routes
+    let app = Router::new()
         .route("/health", get(health_check))
-        .route("/api/v1/datasets", get(list_datasets))
-        .route("/api/v1/datasets/:name", get(get_dataset))
+        // Dataset endpoints
+        .route("/api/v1/datasets", get(list_datasets).post(create_dataset))
+        .route(
+            "/api/v1/datasets/:name",
+            get(get_dataset).put(update_dataset).delete(delete_dataset),
+        )
+        .route("/api/v1/datasets/:name/tags", post(add_tags))
+        .route("/api/v1/datasets/:name/tags/remove", post(remove_tags))
+        // Delta-delegated endpoints
+        .route("/api/v1/datasets/:name/schema", get(get_dataset_schema))
+        .route("/api/v1/datasets/:name/stats", get(get_dataset_stats))
+        .route("/api/v1/datasets/:name/history", get(get_dataset_history))
+        // Quality metrics endpoints
+        .route(
+            "/api/v1/datasets/:name/quality",
+            get(list_quality_metrics).post(create_quality_metric),
+        )
+        // Freshness config endpoints
+        .route(
+            "/api/v1/datasets/:name/freshness",
+            get(get_freshness_config).post(set_freshness_config),
+        )
+        // Owner endpoints
+        .route("/api/v1/owners", get(list_owners).post(create_owner))
+        .route(
+            "/api/v1/owners/:id",
+            get(get_owner).put(update_owner).delete(delete_owner),
+        )
+        // Lineage endpoint
+        .route("/api/v1/lineage", post(create_lineage_edge))
+        // Governance rules endpoints
+        .route(
+            "/api/v1/governance/rules",
+            get(list_governance_rules).post(create_governance_rule),
+        )
+        .route(
+            "/api/v1/governance/rules/:id",
+            get(get_governance_rule)
+                .put(update_governance_rule)
+                .delete(delete_governance_rule),
+        )
+        // Search endpoint
         .route("/api/v1/search", get(search_datasets));
+
+    // Add audit endpoint if audit feature is enabled
+    #[cfg(feature = "audit")]
+    let app = app.route("/api/v1/audit", get(list_audit_logs));
+
+    // Add usage analytics endpoints if usage-analytics feature is enabled
+    #[cfg(feature = "usage-analytics")]
+    let app = app
+        .route("/api/v1/datasets/:name/usage", get(get_dataset_usage))
+        .route("/api/v1/analytics/popular", get(get_popular_datasets))
+        .route("/api/v1/analytics/stale", get(get_stale_datasets));
+
+    // Quality endpoints (core functionality)
+    let app = app
+        .route(
+            "/api/v1/datasets/:name/quality",
+            get(get_dataset_quality).post(compute_dataset_quality),
+        )
+        .route("/api/v1/quality/unhealthy", get(get_unhealthy_datasets));
+
+    // Classification endpoints if classification feature is enabled
+    #[cfg(feature = "classification")]
+    let app = app
+        .route(
+            "/api/v1/datasets/:name/classifications",
+            get(get_dataset_classifications).post(scan_dataset_classifications),
+        )
+        .route("/api/v1/classifications/pii", get(get_all_pii_columns))
+        .route(
+            "/api/v1/fields/:id/classification",
+            axum::routing::put(set_field_classification),
+        );
 
     // Add metrics endpoint if metrics feature is enabled
     #[cfg(feature = "metrics")]
-    {
-        app = app.route("/metrics", get(metrics::metrics_handler));
+    let app = {
         tracing::info!("Metrics endpoint enabled at /metrics");
-    }
+        app.route("/metrics", get(metrics::metrics_handler))
+    };
 
     let app = app
         .layer(middleware::from_fn(request_id_middleware))
@@ -249,7 +772,7 @@ async fn list_datasets(
 
     let mut query = String::from(
         r#"
-        SELECT id, name, path, format, description, tenant, domain, owner,
+        SELECT id, name, path, format, delta_location, description, tenant, domain, owner,
                created_at, last_updated, row_count, size_bytes, partition_keys
         FROM datasets
         WHERE 1=1
@@ -282,20 +805,21 @@ async fn list_datasets(
 
     let datasets = stmt
         .query_map(params_from_iter(bindings.iter()), |row| {
-            let row_count: Option<i64> = row.get(10)?;
-            let size_bytes: Option<i64> = row.get(11)?;
-            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
+            let row_count: Option<i64> = row.get(11)?;
+            let size_bytes: Option<i64> = row.get(12)?;
+            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(13)?);
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
                 format: row.get(3)?,
-                description: row.get(4)?,
-                tenant: row.get(5)?,
-                domain: row.get(6)?,
-                owner: row.get(7)?,
-                created_at: row.get(8)?,
-                last_updated: row.get(9)?,
+                delta_location: row.get(4)?,
+                description: row.get(5)?,
+                tenant: row.get(6)?,
+                domain: row.get(7)?,
+                owner: row.get(8)?,
+                created_at: row.get(9)?,
+                last_updated: row.get(10)?,
                 operational: OperationalMetaResponse {
                     row_count,
                     size_bytes,
@@ -315,128 +839,222 @@ async fn list_datasets(
     Ok(Json(datasets))
 }
 
-/// Get a specific dataset by name
+/// Get a specific dataset by name with optional includes via ?include=delta,quality,lineage
 async fn get_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Path(name): Path<String>,
-) -> Result<Json<DatasetDetailResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset_name = %name, "Getting dataset details");
+    Query(params): Query<DatasetQueryParams>,
+) -> Result<Json<ExtendedDatasetResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate include parameter first
+    let includes =
+        IncludeOptions::parse(&params.include).map_err(|e| bad_request(e, request_id.0.clone()))?;
+
+    tracing::debug!(
+        dataset_name = %name,
+        include_delta = includes.delta,
+        include_quality = includes.quality,
+        include_lineage = includes.lineage,
+        "Getting dataset details"
+    );
 
     // Validate dataset name
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
-        .get_connection()
-        .await
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+    // Perform all synchronous database operations in a block to properly scope borrows
+    let (dataset, fields, tags, upstream_datasets, downstream_datasets, quality_info) = {
+        let conn = state
+            .backend
+            .get_connection()
+            .await
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
-    // Get dataset
-    let dataset: DatasetResponse = conn
-        .query_row(
-            r#"
-        SELECT id, name, path, format, description, tenant, domain, owner,
-               created_at, last_updated, row_count, size_bytes, partition_keys
-        FROM datasets
-        WHERE name = ?1
-        "#,
-            [&name],
-            |row| {
-                let row_count: Option<i64> = row.get(10)?;
-                let size_bytes: Option<i64> = row.get(11)?;
-                let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
-                Ok(DatasetResponse {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    path: row.get(2)?,
-                    format: row.get(3)?,
-                    description: row.get(4)?,
-                    tenant: row.get(5)?,
-                    domain: row.get(6)?,
-                    owner: row.get(7)?,
-                    created_at: row.get(8)?,
-                    last_updated: row.get(9)?,
-                    operational: OperationalMetaResponse {
-                        row_count,
-                        size_bytes,
-                        partition_keys,
-                    },
-                })
-            },
-        )
-        .map_err(|_| {
-            not_found(
-                format!("Dataset '{}' not found", name),
-                request_id.0.clone(),
+        // Get dataset
+        let dataset: DatasetResponse = conn
+            .query_row(
+                r#"
+            SELECT id, name, path, format, delta_location, description, tenant, domain, owner,
+                   created_at, last_updated, row_count, size_bytes, partition_keys
+            FROM datasets
+            WHERE name = ?1
+            "#,
+                [&name],
+                |row| {
+                    let row_count: Option<i64> = row.get(11)?;
+                    let size_bytes: Option<i64> = row.get(12)?;
+                    let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(13)?);
+                    Ok(DatasetResponse {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        path: row.get(2)?,
+                        format: row.get(3)?,
+                        delta_location: row.get(4)?,
+                        description: row.get(5)?,
+                        tenant: row.get(6)?,
+                        domain: row.get(7)?,
+                        owner: row.get(8)?,
+                        created_at: row.get(9)?,
+                        last_updated: row.get(10)?,
+                        operational: OperationalMetaResponse {
+                            row_count,
+                            size_bytes,
+                            partition_keys,
+                        },
+                    })
+                },
             )
-        })?;
+            .map_err(|_| {
+                not_found(
+                    format!("Dataset '{}' not found", name),
+                    request_id.0.clone(),
+                )
+            })?;
 
-    // Get fields
-    let mut stmt = conn
-        .prepare("SELECT name, data_type, nullable, description FROM fields WHERE dataset_id = ?1")
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    let fields = stmt
-        .query_map([dataset.id], |row| {
-            Ok(FieldResponse {
-                name: row.get(0)?,
-                data_type: row.get(1)?,
-                nullable: row.get::<_, i32>(2)? != 0,
-                description: row.get(3)?,
+        // Get fields
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, data_type, nullable, description FROM fields WHERE dataset_id = ?1",
+            )
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        let fields: Vec<FieldResponse> = stmt
+            .query_map([dataset.id], |row| {
+                Ok(FieldResponse {
+                    name: row.get(0)?,
+                    data_type: row.get(1)?,
+                    nullable: row.get::<_, i32>(2)? != 0,
+                    description: row.get(3)?,
+                })
             })
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        drop(stmt);
+
+        // Get tags
+        let mut stmt = conn
+            .prepare("SELECT tag FROM tags WHERE dataset_id = ?1")
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        let tags: Vec<String> = stmt
+            .query_map([dataset.id], |row| row.get::<_, String>(0))
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        drop(stmt);
+
+        // Get upstream datasets
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT d.name
+                FROM lineage l
+                JOIN datasets d ON l.upstream_dataset_id = d.id
+                WHERE l.downstream_dataset_id = ?1
+                "#,
+            )
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        let upstream_datasets: Vec<String> = stmt
+            .query_map([dataset.id], |row| row.get::<_, String>(0))
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        drop(stmt);
+
+        // Get downstream datasets
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT d.name
+                FROM lineage l
+                JOIN datasets d ON l.downstream_dataset_id = d.id
+                WHERE l.upstream_dataset_id = ?1
+                "#,
+            )
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        let downstream_datasets: Vec<String> = stmt
+            .query_map([dataset.id], |row| row.get::<_, String>(0))
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        drop(stmt);
+
+        // Fetch quality metrics from current connection (before dropping it)
+        let quality_info = if includes.quality {
+            conn.query_row(
+                r#"
+                SELECT overall_score, completeness_score, freshness_score, file_health_score, computed_at
+                FROM quality_metrics
+                WHERE dataset_id = ?1
+                ORDER BY computed_at DESC
+                LIMIT 1
+                "#,
+                [dataset.id],
+                |row| {
+                    Ok(QualityInfo {
+                        overall_score: row.get(0)?,
+                        completeness_score: row.get(1)?,
+                        freshness_score: row.get(2)?,
+                        file_health_score: row.get(3)?,
+                        last_computed: row.get(4)?,
+                    })
+                },
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        // Return all data - conn and statements are dropped at end of block
+        (
+            dataset,
+            fields,
+            tags,
+            upstream_datasets,
+            downstream_datasets,
+            quality_info,
+        )
+    };
+
+    // Fetch delta info asynchronously if requested
+    let delta_info = if includes.delta {
+        match &dataset.delta_location {
+            Some(loc) => match state.delta_reader.get_metadata_cached(loc).await {
+                Ok(meta) => Some(DeltaInfo {
+                    version: meta.version,
+                    row_count: meta.row_count,
+                    size_bytes: meta.size_bytes,
+                    num_files: meta.num_files,
+                    partition_columns: meta.partition_columns,
+                    last_modified: Some(meta.last_modified.to_rfc3339()),
+                }),
+                Err(e) => {
+                    tracing::warn!(error = %e, delta_location = %loc, "Failed to fetch delta metadata");
+                    None
+                }
+            },
+            None => {
+                return Err(bad_request(
+                    format!(
+                        "Cannot include delta metadata for dataset '{}': delta_location is not configured",
+                        name
+                    ),
+                    request_id.0.clone(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build structured lineage if requested
+    let lineage_info = if includes.lineage {
+        Some(LineageInfo {
+            upstream: upstream_datasets.clone(),
+            downstream: downstream_datasets.clone(),
         })
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    // Get tags
-    let mut stmt = conn
-        .prepare("SELECT tag FROM tags WHERE dataset_id = ?1")
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    let tags = stmt
-        .query_map([dataset.id], |row| row.get::<_, String>(0))
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    // Get upstream datasets
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT d.name
-            FROM lineage l
-            JOIN datasets d ON l.upstream_dataset_id = d.id
-            WHERE l.downstream_dataset_id = ?1
-            "#,
-        )
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    let upstream_datasets = stmt
-        .query_map([dataset.id], |row| row.get::<_, String>(0))
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    // Get downstream datasets
-    let mut stmt = conn
-        .prepare(
-            r#"
-            SELECT d.name
-            FROM lineage l
-            JOIN datasets d ON l.downstream_dataset_id = d.id
-            WHERE l.upstream_dataset_id = ?1
-            "#,
-        )
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
-
-    let downstream_datasets = stmt
-        .query_map([dataset.id], |row| row.get::<_, String>(0))
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+    } else {
+        None
+    };
 
     tracing::info!(
         dataset_name = %name,
@@ -444,18 +1062,37 @@ async fn get_dataset(
         tag_count = tags.len(),
         upstream_count = upstream_datasets.len(),
         downstream_count = downstream_datasets.len(),
+        include_delta = includes.delta,
+        include_quality = includes.quality,
+        include_lineage = includes.lineage,
+        request_id = %request_id.0,
         "Retrieved dataset details successfully"
     );
 
     #[cfg(feature = "metrics")]
     metrics::record_catalog_operation("get_dataset", "success");
 
-    Ok(Json(DatasetDetailResponse {
+    // Track usage (non-blocking)
+    #[cfg(feature = "usage-analytics")]
+    {
+        let tracker = state.usage_tracker.clone();
+        let dataset_id = dataset.id;
+        tokio::spawn(async move {
+            tracker
+                .record_access(dataset_id, None, usage_analytics::AccessType::Read)
+                .await;
+        });
+    }
+
+    Ok(Json(ExtendedDatasetResponse {
         dataset,
         fields,
         tags,
         upstream_datasets,
         downstream_datasets,
+        delta: delta_info,
+        quality: quality_info,
+        lineage: lineage_info,
     }))
 }
 
@@ -484,7 +1121,7 @@ async fn search_datasets(
     let mut stmt = conn
         .prepare(
             r#"
-            SELECT d.id, d.name, d.path, d.format, d.description, d.tenant, d.domain, d.owner,
+            SELECT d.id, d.name, d.path, d.format, d.delta_location, d.description, d.tenant, d.domain, d.owner,
                    d.created_at, d.last_updated, d.row_count, d.size_bytes, d.partition_keys
             FROM datasets d
             JOIN dataset_search s ON d.name = s.dataset_name
@@ -496,20 +1133,21 @@ async fn search_datasets(
 
     let datasets = stmt
         .query_map([&validated_query], |row| {
-            let row_count: Option<i64> = row.get(10)?;
-            let size_bytes: Option<i64> = row.get(11)?;
-            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(12)?);
+            let row_count: Option<i64> = row.get(11)?;
+            let size_bytes: Option<i64> = row.get(12)?;
+            let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(13)?);
             Ok(DatasetResponse {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: row.get(2)?,
                 format: row.get(3)?,
-                description: row.get(4)?,
-                tenant: row.get(5)?,
-                domain: row.get(6)?,
-                owner: row.get(7)?,
-                created_at: row.get(8)?,
-                last_updated: row.get(9)?,
+                delta_location: row.get(4)?,
+                description: row.get(5)?,
+                tenant: row.get(6)?,
+                domain: row.get(7)?,
+                owner: row.get(8)?,
+                created_at: row.get(9)?,
+                last_updated: row.get(10)?,
                 operational: OperationalMetaResponse {
                     row_count,
                     size_bytes,
@@ -530,7 +1168,698 @@ async fn search_datasets(
     #[cfg(feature = "metrics")]
     metrics::record_catalog_operation("search_datasets", "success");
 
+    // Track search appearances for all returned datasets (non-blocking)
+    #[cfg(feature = "usage-analytics")]
+    {
+        let tracker = state.usage_tracker.clone();
+        let dataset_ids: Vec<i64> = datasets.iter().map(|d| d.id).collect();
+        tokio::spawn(async move {
+            tracker.record_search_appearances(&dataset_ids, None).await;
+        });
+    }
+
     Ok(Json(datasets))
+}
+
+// =============================================================================
+// Audit Log Endpoint (Phase 3)
+// =============================================================================
+
+/// List audit logs with optional filtering
+#[cfg(feature = "audit")]
+async fn list_audit_logs(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<audit::AuditQueryParams>,
+) -> Result<Json<audit::AuditLogResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        entity_type = ?params.entity_type,
+        entity_id = ?params.entity_id,
+        action = ?params.action,
+        limit = ?params.limit,
+        offset = ?params.offset,
+        "Querying audit logs"
+    );
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB query in blocking task to avoid blocking async runtime
+    let req_id = request_id.0.clone();
+    let result = tokio::task::spawn_blocking(move || audit::query_audit_logs(&conn, &params))
+        .await
+        .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+        .map_err(|e| internal_error(e.to_string(), req_id))?;
+
+    tracing::info!(
+        total = result.total,
+        returned = result.entries.len(),
+        "Audit logs query completed"
+    );
+
+    Ok(Json(result))
+}
+
+// =============================================================================
+// Usage Analytics Handlers
+// =============================================================================
+
+/// Query parameters for popular datasets endpoint
+#[cfg(feature = "usage-analytics")]
+#[derive(Debug, Deserialize)]
+struct PopularQueryParams {
+    #[serde(default = "default_popular_limit")]
+    limit: usize,
+    #[serde(default = "default_period")]
+    period: String,
+}
+
+#[cfg(feature = "usage-analytics")]
+fn default_popular_limit() -> usize {
+    10
+}
+
+#[cfg(feature = "usage-analytics")]
+fn default_period() -> String {
+    "7d".to_string()
+}
+
+/// Query parameters for stale datasets endpoint
+#[cfg(feature = "usage-analytics")]
+#[derive(Debug, Deserialize)]
+struct StaleQueryParams {
+    #[serde(default = "default_stale_threshold")]
+    threshold_days: i64,
+}
+
+#[cfg(feature = "usage-analytics")]
+fn default_stale_threshold() -> i64 {
+    30
+}
+
+/// Get usage stats for a specific dataset
+#[cfg(feature = "usage-analytics")]
+async fn get_dataset_usage(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Query(params): Query<usage_analytics::UsageQueryParams>,
+) -> Result<Json<usage_analytics::DatasetUsageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        dataset_name = %name,
+        period = %params.period,
+        "Querying dataset usage"
+    );
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB queries in blocking task to avoid blocking async runtime
+    let req_id = request_id.0.clone();
+    let dataset_name_clone = name.clone();
+    let period = params.period.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // First, look up the dataset to get its ID
+        let dataset: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, name FROM datasets WHERE name = ?1",
+                [&dataset_name_clone],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        match dataset {
+            Some((dataset_id, dataset_name)) => {
+                usage_analytics::query_dataset_usage(&conn, dataset_id, &dataset_name, &period)
+                    .map_err(|e| e.to_string())
+            }
+            None => Err(format!("Dataset '{}' not found", dataset_name_clone)),
+        }
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e| {
+        if e.contains("not found") {
+            not_found(e, req_id.clone())
+        } else {
+            internal_error(e, req_id.clone())
+        }
+    })?;
+
+    tracing::info!(
+        dataset_name = %name,
+        total_reads = result.total_reads,
+        "Dataset usage query completed"
+    );
+
+    Ok(Json(result))
+}
+
+/// Get most popular datasets by access count
+#[cfg(feature = "usage-analytics")]
+async fn get_popular_datasets(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<PopularQueryParams>,
+) -> Result<Json<usage_analytics::PopularDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        limit = params.limit,
+        period = %params.period,
+        "Querying popular datasets"
+    );
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB query in blocking task to avoid blocking async runtime
+    let req_id = request_id.0.clone();
+    let period = params.period.clone();
+    let limit = params.limit;
+
+    let result = tokio::task::spawn_blocking(move || {
+        usage_analytics::query_popular_datasets(&conn, &period, limit)
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e| internal_error(e.to_string(), req_id))?;
+
+    tracing::info!(
+        count = result.datasets.len(),
+        "Popular datasets query completed"
+    );
+
+    Ok(Json(result))
+}
+
+/// Get stale datasets (no recent access)
+#[cfg(feature = "usage-analytics")]
+async fn get_stale_datasets(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<StaleQueryParams>,
+) -> Result<Json<usage_analytics::StaleDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        threshold_days = params.threshold_days,
+        "Querying stale datasets"
+    );
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB query in blocking task to avoid blocking async runtime
+    let req_id = request_id.0.clone();
+    let threshold_days = params.threshold_days;
+
+    let result = tokio::task::spawn_blocking(move || {
+        usage_analytics::query_stale_datasets(&conn, threshold_days)
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e| internal_error(e.to_string(), req_id))?;
+
+    tracing::info!(
+        count = result.datasets.len(),
+        "Stale datasets query completed"
+    );
+
+    Ok(Json(result))
+}
+
+// =============================================================================
+// Quality Framework Handlers
+// =============================================================================
+
+/// Query parameters for unhealthy datasets endpoint
+#[derive(Debug, Deserialize)]
+struct UnhealthyQueryParams {
+    #[serde(default = "default_unhealthy_threshold")]
+    threshold: f64,
+}
+
+fn default_unhealthy_threshold() -> f64 {
+    0.7
+}
+
+/// Get quality scores for a specific dataset
+async fn get_dataset_quality(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<quality::QualityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset_name = %name, "Getting dataset quality");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Look up dataset
+    let dataset: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, name FROM datasets WHERE name = ?1",
+            [&name],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (dataset_id, dataset_name) = dataset.ok_or_else(|| {
+        not_found(
+            format!("Dataset '{}' not found", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get latest quality scores
+    let result = quality::get_latest_quality(&conn, dataset_id, &dataset_name)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    match result {
+        Some(quality) => {
+            tracing::info!(
+                dataset_name = %name,
+                overall_score = ?quality.scores.overall_score,
+                "Quality scores retrieved"
+            );
+            Ok(Json(quality))
+        }
+        None => Err(not_found(
+            format!("No quality scores found for dataset '{}'", name),
+            request_id.0,
+        )),
+    }
+}
+
+/// Trigger quality computation for a dataset
+async fn compute_dataset_quality(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<quality::QualityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::info!(dataset_name = %name, "Computing dataset quality");
+
+    // First, look up the dataset and get delta_location (sync DB operation)
+    let (dataset_id, dataset_name, delta_location) = {
+        let conn = state
+            .backend
+            .get_connection()
+            .await
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+        let dataset: Option<(i64, String, Option<String>)> = conn
+            .query_row(
+                "SELECT id, name, delta_location FROM datasets WHERE name = ?1",
+                [&name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        let (id, ds_name, loc) = dataset.ok_or_else(|| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+        let loc = loc.ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!(
+                        "Dataset '{}' has no delta_location configured for quality computation",
+                        name
+                    ),
+                    request_id: request_id.0.clone(),
+                }),
+            )
+        })?;
+
+        (id, ds_name, loc)
+    };
+
+    // Get Delta metadata (async operation)
+    let delta_metadata = state
+        .delta_reader
+        .get_metadata_cached(&delta_location)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Now compute and store scores (sync DB operations)
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let scores = quality::compute_scores_from_metadata(&conn, dataset_id, &delta_metadata)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Store the scores
+    quality::store_quality_scores(&conn, dataset_id, &scores)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Return the response
+    let response = quality::QualityResponse {
+        dataset_id,
+        dataset_name,
+        computed_at: chrono::Utc::now().to_rfc3339(),
+        scores,
+    };
+
+    tracing::info!(
+        dataset_name = %name,
+        overall_score = ?response.scores.overall_score,
+        "Quality scores computed and stored"
+    );
+
+    Ok(Json(response))
+}
+
+/// Get datasets with quality below threshold
+async fn get_unhealthy_datasets(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<UnhealthyQueryParams>,
+) -> Result<Json<quality::UnhealthyDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(threshold = params.threshold, "Querying unhealthy datasets");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let result = quality::get_unhealthy_datasets(&conn, params.threshold)
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(
+        count = result.datasets.len(),
+        threshold = params.threshold,
+        "Unhealthy datasets query completed"
+    );
+
+    Ok(Json(result))
+}
+
+// =============================================================================
+// Classification Handlers
+// =============================================================================
+
+/// Get classifications for a dataset's columns
+#[cfg(feature = "classification")]
+async fn get_dataset_classifications(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
+{
+    tracing::debug!(dataset_name = %name, "Getting dataset classifications");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB queries in blocking task to avoid blocking async runtime
+    let req_id = request_id.0.clone();
+    let dataset_name_clone = name.clone();
+
+    let response = tokio::task::spawn_blocking(move || {
+        // Look up dataset
+        let dataset: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, name FROM datasets WHERE name = ?1",
+                [&dataset_name_clone],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        let (dataset_id, dataset_name) = match dataset {
+            Some(d) => d,
+            None => return Err(format!("Dataset '{}' not found", dataset_name_clone)),
+        };
+
+        let classifications = classification::get_dataset_classifications(&conn, dataset_id)
+            .map_err(|e| e.to_string())?;
+
+        let pii_count = classifications
+            .iter()
+            .filter(|c| c.classification == classification::Classification::Pii)
+            .count();
+        let unclassified_count = classifications
+            .iter()
+            .filter(|c| c.classification == classification::Classification::Unknown)
+            .count();
+
+        Ok(classification::DatasetClassificationsResponse {
+            dataset_id,
+            dataset_name,
+            classifications,
+            pii_count,
+            unclassified_count,
+        })
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e: String| {
+        if e.contains("not found") {
+            not_found(e, req_id.clone())
+        } else {
+            internal_error(e, req_id.clone())
+        }
+    })?;
+
+    tracing::info!(
+        dataset_name = %name,
+        pii_count = response.pii_count,
+        "Dataset classifications retrieved"
+    );
+
+    Ok(Json(response))
+}
+
+/// Scan a dataset for classifications
+#[cfg(feature = "classification")]
+async fn scan_dataset_classifications(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
+{
+    tracing::info!(dataset_name = %name, "Scanning dataset for classifications");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run heavy classification work in blocking task
+    let req_id = request_id.0.clone();
+    let dataset_name_clone = name.clone();
+
+    let (response, fields_scanned) = tokio::task::spawn_blocking(move || {
+        // Look up dataset
+        let dataset: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, name FROM datasets WHERE name = ?1",
+                [&dataset_name_clone],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        let (dataset_id, dataset_name) = match dataset {
+            Some(d) => d,
+            None => return Err(format!("Dataset '{}' not found", dataset_name_clone)),
+        };
+
+        // Load classification engine
+        let engine =
+            classification::ClassificationEngine::load_from_db(&conn).map_err(|e| e.to_string())?;
+
+        // Get fields for this dataset
+        let mut stmt = conn
+            .prepare("SELECT id, name, data_type FROM fields WHERE dataset_id = ?1")
+            .map_err(|e| e.to_string())?;
+
+        let fields: Vec<(i64, String, String)> = stmt
+            .query_map([dataset_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        let fields_count = fields.len();
+
+        // Scan and store classifications
+        let mut pii_count = 0;
+        let mut unclassified_count = 0;
+
+        for (field_id, field_name, data_type) in &fields {
+            let result = engine.classify_column(field_name, data_type);
+
+            if result.classification == classification::Classification::Pii {
+                pii_count += 1;
+            } else if result.classification == classification::Classification::Unknown {
+                unclassified_count += 1;
+            }
+
+            classification::store_classification(&conn, *field_id, &result)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Get updated classifications
+        let classifications = classification::get_dataset_classifications(&conn, dataset_id)
+            .map_err(|e| e.to_string())?;
+
+        let response = classification::DatasetClassificationsResponse {
+            dataset_id,
+            dataset_name,
+            classifications,
+            pii_count,
+            unclassified_count,
+        };
+
+        Ok((response, fields_count))
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e: String| {
+        if e.contains("not found") {
+            not_found(e, req_id.clone())
+        } else {
+            internal_error(e, req_id.clone())
+        }
+    })?;
+
+    tracing::info!(
+        dataset_name = %name,
+        pii_count = response.pii_count,
+        fields_scanned,
+        "Dataset classification scan completed"
+    );
+
+    Ok(Json(response))
+}
+
+/// Get all PII columns across all datasets
+#[cfg(feature = "classification")]
+async fn get_all_pii_columns(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Result<Json<classification::PiiColumnsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!("Getting all PII columns");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB query in blocking task
+    let req_id = request_id.0.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let columns = classification::get_pii_columns(&conn)?;
+        let verified_count = columns.iter().filter(|c| c.verified).count();
+
+        Ok::<_, rusqlite::Error>(classification::PiiColumnsResponse {
+            total_pii_columns: columns.len(),
+            verified_count,
+            columns,
+        })
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e| internal_error(e.to_string(), req_id))?;
+
+    tracing::info!(
+        total_pii = response.total_pii_columns,
+        verified = response.verified_count,
+        "PII columns query completed"
+    );
+
+    Ok(Json(response))
+}
+
+/// Set a manual classification for a field
+#[cfg(feature = "classification")]
+async fn set_field_classification(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(field_id): Path<i64>,
+    Json(req): Json<classification::SetClassificationRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::info!(field_id, classification = %req.classification, "Setting manual classification");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Run DB operations in blocking task
+    let req_id = request_id.0.clone();
+    let classification_str = req.classification.clone();
+    let category = req.category.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Verify field exists
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM fields WHERE id = ?1", [field_id], |_| {
+                Ok(true)
+            })
+            .unwrap_or(false);
+
+        if !exists {
+            return Err(format!("Field {} not found", field_id));
+        }
+
+        let classification_type = classification::Classification::parse(&classification_str);
+
+        // For now, use a placeholder user - in production this would come from auth
+        classification::set_manual_classification(
+            &conn,
+            field_id,
+            classification_type,
+            category.as_deref(),
+            "api_user",
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| internal_error(format!("Task join error: {}", e), req_id.clone()))?
+    .map_err(|e: String| {
+        if e.contains("not found") {
+            not_found(e, req_id.clone())
+        } else {
+            internal_error(e, req_id.clone())
+        }
+    })?;
+
+    tracing::info!(field_id, "Manual classification set");
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "field_id": field_id,
+        "classification": req.classification
+    })))
 }
 
 /// Helper function to create internal error response
@@ -579,4 +1908,1664 @@ fn bad_request(message: String, request_id: String) -> (StatusCode, Json<ErrorRe
 fn parse_partition_keys(raw: Option<String>) -> Vec<String> {
     raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default()
+}
+
+// =============================================================================
+// Dataset Write Handlers
+// =============================================================================
+
+/// Create a new dataset
+async fn create_dataset(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<CreateDatasetRequest>,
+) -> Result<(StatusCode, Json<DatasetResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %req.name, "Creating dataset");
+
+    // Validate inputs
+    validation::validate_dataset_name(&req.name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Check if dataset already exists
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM datasets WHERE name = ?1",
+            [&req.name],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if exists {
+        return Err(bad_request(
+            format!("Dataset '{}' already exists", req.name),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Use transaction for multi-step write
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Insert dataset
+    tx.execute(
+        r#"
+        INSERT INTO datasets (name, path, format, delta_location, description, tenant, domain, owner, created_at, last_updated)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'), datetime('now'))
+        "#,
+        rusqlite::params![
+            req.name,
+            req.path,
+            req.format,
+            req.delta_location,
+            req.description,
+            req.tenant,
+            req.domain,
+            req.owner,
+        ],
+    )
+    .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id = tx.last_insert_rowid();
+
+    // Insert tags if provided
+    if let Some(tags) = &req.tags {
+        for tag in tags {
+            tx.execute(
+                "INSERT INTO tags (dataset_id, tag) VALUES (?1, ?2)",
+                rusqlite::params![dataset_id, tag],
+            )
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+        }
+    }
+
+    // Insert lineage if provided
+    if let Some(upstream) = &req.upstream_datasets {
+        for upstream_name in upstream {
+            let upstream_id: Result<i64, _> = tx.query_row(
+                "SELECT id FROM datasets WHERE name = ?1",
+                [upstream_name],
+                |row| row.get(0),
+            );
+            if let Ok(uid) = upstream_id {
+                tx.execute(
+                    "INSERT OR IGNORE INTO lineage (upstream_dataset_id, downstream_dataset_id, created_at) VALUES (?1, ?2, datetime('now'))",
+                    rusqlite::params![uid, dataset_id],
+                )
+                .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+            }
+        }
+    }
+
+    // Fetch the created dataset (still within transaction)
+    let dataset: DatasetResponse = tx
+        .query_row(
+            r#"
+            SELECT id, name, path, format, delta_location, description, tenant, domain, owner,
+                   created_at, last_updated, row_count, size_bytes, partition_keys
+            FROM datasets WHERE id = ?1
+            "#,
+            [dataset_id],
+            |row| {
+                let row_count: Option<i64> = row.get(11)?;
+                let size_bytes: Option<i64> = row.get(12)?;
+                let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(13)?);
+                Ok(DatasetResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    format: row.get(3)?,
+                    delta_location: row.get(4)?,
+                    description: row.get(5)?,
+                    tenant: row.get(6)?,
+                    domain: row.get(7)?,
+                    owner: row.get(8)?,
+                    created_at: row.get(9)?,
+                    last_updated: row.get(10)?,
+                    operational: OperationalMetaResponse {
+                        row_count,
+                        size_bytes,
+                        partition_keys,
+                    },
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Commit transaction
+    tx.commit()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(name = %req.name, id = dataset_id, "Dataset created successfully");
+
+    #[cfg(feature = "metrics")]
+    metrics::record_catalog_operation("create_dataset", "success");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "dataset",
+            &dataset.name,
+            serde_json::json!({
+                "id": dataset.id,
+                "name": dataset.name,
+                "path": dataset.path,
+                "format": dataset.format,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(event);
+    }
+
+    Ok((StatusCode::CREATED, Json(dataset)))
+}
+
+/// Update an existing dataset
+async fn update_dataset(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateDatasetRequest>,
+) -> Result<Json<DatasetResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, "Updating dataset");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get the dataset ID first
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Build dynamic update query and execute in a block to drop non-Send types before await
+    let delta_location_to_invalidate: Option<String> = {
+        let mut updates = vec!["last_updated = datetime('now')".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+        if let Some(path) = &req.path {
+            updates.push(format!("path = ?{}", params.len() + 1));
+            params.push(Box::new(path.clone()));
+        }
+        if let Some(format) = &req.format {
+            updates.push(format!("format = ?{}", params.len() + 1));
+            params.push(Box::new(format.clone()));
+        }
+        if let Some(delta_location) = &req.delta_location {
+            updates.push(format!("delta_location = ?{}", params.len() + 1));
+            params.push(Box::new(delta_location.clone()));
+        }
+        if let Some(description) = &req.description {
+            updates.push(format!("description = ?{}", params.len() + 1));
+            params.push(Box::new(description.clone()));
+        }
+        if let Some(tenant) = &req.tenant {
+            updates.push(format!("tenant = ?{}", params.len() + 1));
+            params.push(Box::new(tenant.clone()));
+        }
+        if let Some(domain) = &req.domain {
+            updates.push(format!("domain = ?{}", params.len() + 1));
+            params.push(Box::new(domain.clone()));
+        }
+        if let Some(owner) = &req.owner {
+            updates.push(format!("owner = ?{}", params.len() + 1));
+            params.push(Box::new(owner.clone()));
+        }
+
+        let sql = format!(
+            "UPDATE datasets SET {} WHERE id = ?{}",
+            updates.join(", "),
+            params.len() + 1
+        );
+        params.push(Box::new(dataset_id));
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        conn.execute(&sql, params_refs.as_slice())
+            .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+        // Capture delta_location for cache invalidation if it was updated
+        if req.delta_location.is_some() {
+            conn.query_row::<String, _, _>(
+                "SELECT delta_location FROM datasets WHERE id = ?1",
+                [dataset_id],
+                |row| row.get(0),
+            )
+            .ok()
+        } else {
+            None
+        }
+    };
+
+    // Now that non-Send types are dropped, we can await
+    if let Some(loc) = delta_location_to_invalidate {
+        state.delta_reader.invalidate_cache(&loc).await;
+    }
+
+    // Fetch updated dataset
+    let dataset: DatasetResponse = conn
+        .query_row(
+            r#"
+            SELECT id, name, path, format, delta_location, description, tenant, domain, owner,
+                   created_at, last_updated, row_count, size_bytes, partition_keys
+            FROM datasets WHERE id = ?1
+            "#,
+            [dataset_id],
+            |row| {
+                let row_count: Option<i64> = row.get(11)?;
+                let size_bytes: Option<i64> = row.get(12)?;
+                let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(13)?);
+                Ok(DatasetResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    format: row.get(3)?,
+                    delta_location: row.get(4)?,
+                    description: row.get(5)?,
+                    tenant: row.get(6)?,
+                    domain: row.get(7)?,
+                    owner: row.get(8)?,
+                    created_at: row.get(9)?,
+                    last_updated: row.get(10)?,
+                    operational: OperationalMetaResponse {
+                        row_count,
+                        size_bytes,
+                        partition_keys,
+                    },
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(name = %name, "Dataset updated successfully");
+
+    #[cfg(feature = "metrics")]
+    metrics::record_catalog_operation("update_dataset", "success");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "dataset",
+            &name,
+            serde_json::json!({}), // old values not tracked for simplicity
+            serde_json::json!({
+                "id": dataset.id,
+                "name": dataset.name,
+                "path": dataset.path,
+                "format": dataset.format,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(event);
+    }
+
+    Ok(Json(dataset))
+}
+
+/// Delete a dataset
+async fn delete_dataset(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, "Deleting dataset");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get delta_location before deleting to invalidate cache
+    if let Ok(loc) = conn.query_row::<String, _, _>(
+        "SELECT delta_location FROM datasets WHERE name = ?1",
+        [&name],
+        |row| row.get(0),
+    ) {
+        state.delta_reader.invalidate_cache(&loc).await;
+    }
+
+    let rows = conn
+        .execute("DELETE FROM datasets WHERE name = ?1", [&name])
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows == 0 {
+        return Err(not_found(
+            format!("Dataset '{}' not found", name),
+            request_id.0.clone(),
+        ));
+    }
+
+    tracing::info!(name = %name, "Dataset deleted successfully");
+
+    #[cfg(feature = "metrics")]
+    metrics::record_catalog_operation("delete_dataset", "success");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "dataset",
+            &name,
+            serde_json::json!({ "name": name }),
+            &request_id.0,
+        );
+        state.audit_logger.log(event);
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Add tags to a dataset
+async fn add_tags(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Json(req): Json<AddTagsRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, tags = ?req.tags, "Adding tags to dataset");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    for tag in &req.tags {
+        conn.execute(
+            "INSERT OR IGNORE INTO tags (dataset_id, tag) VALUES (?1, ?2)",
+            rusqlite::params![dataset_id, tag],
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+    }
+
+    // Get all tags for the dataset
+    let mut stmt = conn
+        .prepare("SELECT tag FROM tags WHERE dataset_id = ?1")
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let tags = stmt
+        .query_map([dataset_id], |row| row.get::<_, String>(0))
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(name = %name, added = req.tags.len(), "Tags added successfully");
+
+    Ok(Json(tags))
+}
+
+/// Remove tags from a dataset
+async fn remove_tags(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Json(req): Json<RemoveTagsRequest>,
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, tags = ?req.tags, "Removing tags from dataset");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    for tag in &req.tags {
+        conn.execute(
+            "DELETE FROM tags WHERE dataset_id = ?1 AND tag = ?2",
+            rusqlite::params![dataset_id, tag],
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+    }
+
+    // Get remaining tags
+    let mut stmt = conn
+        .prepare("SELECT tag FROM tags WHERE dataset_id = ?1")
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let tags = stmt
+        .query_map([dataset_id], |row| row.get::<_, String>(0))
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(name = %name, removed = req.tags.len(), "Tags removed successfully");
+
+    Ok(Json(tags))
+}
+
+// =============================================================================
+// Owner Handlers
+// =============================================================================
+
+/// Create a new owner
+async fn create_owner(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<CreateOwnerRequest>,
+) -> Result<(StatusCode, Json<OwnerResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(owner_id = %req.owner_id, "Creating owner");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let owner_type = req.owner_type.as_deref().unwrap_or("user");
+    let contact_info_json = req.contact_info.as_ref().map(|v| v.to_string());
+
+    conn.execute(
+        r#"
+        INSERT INTO owners (owner_id, name, owner_type, email, slack_channel, contact_info, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), datetime('now'))
+        "#,
+        rusqlite::params![
+            req.owner_id,
+            req.name,
+            owner_type,
+            req.email,
+            req.slack_channel,
+            contact_info_json,
+        ],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            bad_request(
+                format!("Owner '{}' already exists", req.owner_id),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
+
+    let id = conn.last_insert_rowid();
+
+    let owner = OwnerResponse {
+        id,
+        owner_id: req.owner_id,
+        name: req.name,
+        owner_type: owner_type.to_string(),
+        email: req.email,
+        slack_channel: req.slack_channel,
+        contact_info: req.contact_info,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    tracing::info!(owner_id = %owner.owner_id, "Owner created successfully");
+
+    Ok((StatusCode::CREATED, Json(owner)))
+}
+
+/// List all owners
+async fn list_owners(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(pagination): Query<PaginationParams>,
+) -> Result<Json<Vec<OwnerResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        limit = pagination.limit(),
+        offset = pagination.offset(),
+        "Listing owners"
+    );
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, owner_id, name, owner_type, email, slack_channel, contact_info, created_at, updated_at
+            FROM owners ORDER BY name LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let owners = stmt
+        .query_map(
+            rusqlite::params![pagination.limit() as i64, pagination.offset() as i64],
+            |row| {
+                let contact_info: Option<String> = row.get(6)?;
+                Ok(OwnerResponse {
+                    id: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    name: row.get(2)?,
+                    owner_type: row.get(3)?,
+                    email: row.get(4)?,
+                    slack_channel: row.get(5)?,
+                    contact_info: contact_info.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(count = owners.len(), "Listed owners successfully");
+
+    Ok(Json(owners))
+}
+
+/// Get an owner by ID
+async fn get_owner(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<String>,
+) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(owner_id = %id, "Getting owner");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let owner = conn
+        .query_row(
+            r#"
+            SELECT id, owner_id, name, owner_type, email, slack_channel, contact_info, created_at, updated_at
+            FROM owners WHERE owner_id = ?1
+            "#,
+            [&id],
+            |row| {
+                let contact_info: Option<String> = row.get(6)?;
+                Ok(OwnerResponse {
+                    id: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    name: row.get(2)?,
+                    owner_type: row.get(3)?,
+                    email: row.get(4)?,
+                    slack_channel: row.get(5)?,
+                    contact_info: contact_info.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|_| not_found(format!("Owner '{}' not found", id), request_id.0.clone()))?;
+
+    Ok(Json(owner))
+}
+
+/// Update an owner
+async fn update_owner(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateOwnerRequest>,
+) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(owner_id = %id, "Updating owner");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Build dynamic update query
+    let mut updates = vec!["updated_at = datetime('now')".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+    if let Some(name) = &req.name {
+        updates.push(format!("name = ?{}", params.len() + 1));
+        params.push(Box::new(name.clone()));
+    }
+    if let Some(owner_type) = &req.owner_type {
+        updates.push(format!("owner_type = ?{}", params.len() + 1));
+        params.push(Box::new(owner_type.clone()));
+    }
+    if let Some(email) = &req.email {
+        updates.push(format!("email = ?{}", params.len() + 1));
+        params.push(Box::new(email.clone()));
+    }
+    if let Some(slack_channel) = &req.slack_channel {
+        updates.push(format!("slack_channel = ?{}", params.len() + 1));
+        params.push(Box::new(slack_channel.clone()));
+    }
+    if let Some(contact_info) = &req.contact_info {
+        updates.push(format!("contact_info = ?{}", params.len() + 1));
+        params.push(Box::new(contact_info.to_string()));
+    }
+
+    let sql = format!(
+        "UPDATE owners SET {} WHERE owner_id = ?{}",
+        updates.join(", "),
+        params.len() + 1
+    );
+    params.push(Box::new(id.clone()));
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = conn
+        .execute(&sql, params_refs.as_slice())
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows == 0 {
+        return Err(not_found(
+            format!("Owner '{}' not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Fetch updated owner
+    let owner = conn
+        .query_row(
+            r#"
+            SELECT id, owner_id, name, owner_type, email, slack_channel, contact_info, created_at, updated_at
+            FROM owners WHERE owner_id = ?1
+            "#,
+            [&id],
+            |row| {
+                let contact_info: Option<String> = row.get(6)?;
+                Ok(OwnerResponse {
+                    id: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    name: row.get(2)?,
+                    owner_type: row.get(3)?,
+                    email: row.get(4)?,
+                    slack_channel: row.get(5)?,
+                    contact_info: contact_info.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(owner_id = %id, "Owner updated successfully");
+
+    Ok(Json(owner))
+}
+
+/// Delete an owner
+async fn delete_owner(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(owner_id = %id, "Deleting owner");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let rows = conn
+        .execute("DELETE FROM owners WHERE owner_id = ?1", [&id])
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows == 0 {
+        return Err(not_found(
+            format!("Owner '{}' not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    tracing::info!(owner_id = %id, "Owner deleted successfully");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// =============================================================================
+// Lineage Handlers
+// =============================================================================
+
+/// Create a lineage edge between two datasets
+async fn create_lineage_edge(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<CreateLineageEdgeRequest>,
+) -> Result<(StatusCode, Json<LineageEdgeResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        source = %req.source_dataset,
+        target = %req.target_dataset,
+        "Creating lineage edge"
+    );
+
+    validation::validate_dataset_name(&req.source_dataset)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+    validation::validate_dataset_name(&req.target_dataset)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get source dataset ID
+    let source_id: i64 = conn
+        .query_row(
+            "SELECT id FROM datasets WHERE name = ?1",
+            [&req.source_dataset],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Source dataset '{}' not found", req.source_dataset),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Get target dataset ID
+    let target_id: i64 = conn
+        .query_row(
+            "SELECT id FROM datasets WHERE name = ?1",
+            [&req.target_dataset],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Target dataset '{}' not found", req.target_dataset),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Insert lineage edge
+    conn.execute(
+        "INSERT OR IGNORE INTO lineage (upstream_dataset_id, downstream_dataset_id, created_at) VALUES (?1, ?2, datetime('now'))",
+        rusqlite::params![source_id, target_id],
+    )
+    .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get the lineage edge
+    let edge = conn
+        .query_row(
+            "SELECT id, upstream_dataset_id, downstream_dataset_id, created_at FROM lineage WHERE upstream_dataset_id = ?1 AND downstream_dataset_id = ?2",
+            rusqlite::params![source_id, target_id],
+            |row| {
+                Ok(LineageEdgeResponse {
+                    id: row.get(0)?,
+                    upstream_dataset_id: row.get(1)?,
+                    downstream_dataset_id: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(
+        source = %req.source_dataset,
+        target = %req.target_dataset,
+        "Lineage edge created successfully"
+    );
+
+    Ok((StatusCode::CREATED, Json(edge)))
+}
+
+// =============================================================================
+// Governance Rules Handlers
+// =============================================================================
+
+/// Create a governance rule
+async fn create_governance_rule(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Json(req): Json<CreateGovernanceRuleRequest>,
+) -> Result<(StatusCode, Json<GovernanceRuleResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %req.name, "Creating governance rule");
+
+    // Validate rule type
+    validation::validate_rule_type(&req.rule_type)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let priority = req.priority.unwrap_or(100);
+
+    conn.execute(
+        r#"
+        INSERT INTO governance_rules (name, rule_type, description, config, priority, is_active, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'), datetime('now'))
+        "#,
+        rusqlite::params![
+            req.name,
+            req.rule_type,
+            req.description,
+            req.config.to_string(),
+            priority,
+        ],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            bad_request(
+                format!("Governance rule '{}' already exists", req.name),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
+
+    let id = conn.last_insert_rowid();
+
+    let rule = GovernanceRuleResponse {
+        id,
+        name: req.name,
+        rule_type: req.rule_type,
+        description: req.description,
+        config: req.config,
+        priority,
+        is_active: true,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    tracing::info!(name = %rule.name, "Governance rule created successfully");
+
+    Ok((StatusCode::CREATED, Json(rule)))
+}
+
+/// List all governance rules
+async fn list_governance_rules(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(pagination): Query<PaginationParams>,
+) -> Result<Json<Vec<GovernanceRuleResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        limit = pagination.limit(),
+        offset = pagination.offset(),
+        "Listing governance rules"
+    );
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, name, rule_type, description, config, priority, is_active, created_at, updated_at
+            FROM governance_rules ORDER BY priority, name LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let rules = stmt
+        .query_map(
+            rusqlite::params![pagination.limit() as i64, pagination.offset() as i64],
+            |row| {
+                let config_str: String = row.get(4)?;
+                Ok(GovernanceRuleResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    rule_type: row.get(2)?,
+                    description: row.get(3)?,
+                    config: serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null),
+                    priority: row.get(5)?,
+                    is_active: row.get::<_, i32>(6)? != 0,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(count = rules.len(), "Listed governance rules successfully");
+
+    Ok(Json(rules))
+}
+
+/// Get a governance rule by ID
+async fn get_governance_rule(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<i64>,
+) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(id = %id, "Getting governance rule");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let rule = conn
+        .query_row(
+            r#"
+            SELECT id, name, rule_type, description, config, priority, is_active, created_at, updated_at
+            FROM governance_rules WHERE id = ?1
+            "#,
+            [id],
+            |row| {
+                let config_str: String = row.get(4)?;
+                Ok(GovernanceRuleResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    rule_type: row.get(2)?,
+                    description: row.get(3)?,
+                    config: serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null),
+                    priority: row.get(5)?,
+                    is_active: row.get::<_, i32>(6)? != 0,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Governance rule '{}' not found", id),
+                request_id.0.clone(),
+            )
+        })?;
+
+    Ok(Json(rule))
+}
+
+/// Update a governance rule
+async fn update_governance_rule(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateGovernanceRuleRequest>,
+) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(id = %id, "Updating governance rule");
+
+    // Validate rule type if provided
+    if let Some(ref rule_type) = req.rule_type {
+        validation::validate_rule_type(rule_type)
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let mut updates = vec!["updated_at = datetime('now')".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+    if let Some(name) = &req.name {
+        updates.push(format!("name = ?{}", params.len() + 1));
+        params.push(Box::new(name.clone()));
+    }
+    if let Some(rule_type) = &req.rule_type {
+        updates.push(format!("rule_type = ?{}", params.len() + 1));
+        params.push(Box::new(rule_type.clone()));
+    }
+    if let Some(description) = &req.description {
+        updates.push(format!("description = ?{}", params.len() + 1));
+        params.push(Box::new(description.clone()));
+    }
+    if let Some(config) = &req.config {
+        updates.push(format!("config = ?{}", params.len() + 1));
+        params.push(Box::new(config.to_string()));
+    }
+    if let Some(priority) = &req.priority {
+        updates.push(format!("priority = ?{}", params.len() + 1));
+        params.push(Box::new(*priority));
+    }
+    if let Some(is_active) = &req.is_active {
+        updates.push(format!("is_active = ?{}", params.len() + 1));
+        params.push(Box::new(if *is_active { 1i32 } else { 0i32 }));
+    }
+
+    let sql = format!(
+        "UPDATE governance_rules SET {} WHERE id = ?{}",
+        updates.join(", "),
+        params.len() + 1
+    );
+    params.push(Box::new(id));
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = conn
+        .execute(&sql, params_refs.as_slice())
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows == 0 {
+        return Err(not_found(
+            format!("Governance rule '{}' not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Fetch updated rule
+    let rule = conn
+        .query_row(
+            r#"
+            SELECT id, name, rule_type, description, config, priority, is_active, created_at, updated_at
+            FROM governance_rules WHERE id = ?1
+            "#,
+            [id],
+            |row| {
+                let config_str: String = row.get(4)?;
+                Ok(GovernanceRuleResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    rule_type: row.get(2)?,
+                    description: row.get(3)?,
+                    config: serde_json::from_str(&config_str).unwrap_or(serde_json::Value::Null),
+                    priority: row.get(5)?,
+                    is_active: row.get::<_, i32>(6)? != 0,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(id = %id, "Governance rule updated successfully");
+
+    Ok(Json(rule))
+}
+
+/// Delete a governance rule
+async fn delete_governance_rule(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(id = %id, "Deleting governance rule");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let rows = conn
+        .execute("DELETE FROM governance_rules WHERE id = ?1", [id])
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows == 0 {
+        return Err(not_found(
+            format!("Governance rule '{}' not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    tracing::info!(id = %id, "Governance rule deleted successfully");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// =============================================================================
+// Quality Metrics Handlers
+// =============================================================================
+
+/// Create a quality metric for a dataset
+async fn create_quality_metric(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Json(req): Json<CreateQualityMetricRequest>,
+) -> Result<(StatusCode, Json<QualityMetricResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, "Creating quality metric");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    // Validate score values (must be 0.0 to 1.0)
+    if let Some(score) = req.completeness_score {
+        validation::validate_score(score, "completeness_score")
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+    }
+    if let Some(score) = req.freshness_score {
+        validation::validate_score(score, "freshness_score")
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+    }
+    if let Some(score) = req.file_health_score {
+        validation::validate_score(score, "file_health_score")
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+    }
+    if let Some(score) = req.overall_score {
+        validation::validate_score(score, "overall_score")
+            .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let details_json = req.details.as_ref().map(|v| v.to_string());
+
+    conn.execute(
+        r#"
+        INSERT INTO quality_metrics (dataset_id, computed_at, completeness_score, freshness_score, file_health_score, overall_score, row_count, file_count, size_bytes, details)
+        VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+        rusqlite::params![
+            dataset_id,
+            req.completeness_score,
+            req.freshness_score,
+            req.file_health_score,
+            req.overall_score,
+            req.row_count,
+            req.file_count,
+            req.size_bytes,
+            details_json,
+        ],
+    )
+    .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let id = conn.last_insert_rowid();
+
+    let metric = QualityMetricResponse {
+        id,
+        dataset_id,
+        computed_at: chrono::Utc::now().to_rfc3339(),
+        completeness_score: req.completeness_score,
+        freshness_score: req.freshness_score,
+        file_health_score: req.file_health_score,
+        overall_score: req.overall_score,
+        row_count: req.row_count,
+        file_count: req.file_count,
+        size_bytes: req.size_bytes,
+        details: req.details,
+    };
+
+    tracing::info!(dataset = %name, "Quality metric created successfully");
+
+    Ok((StatusCode::CREATED, Json(metric)))
+}
+
+/// List quality metrics for a dataset
+async fn list_quality_metrics(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<QualityMetricResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, "Listing quality metrics");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, dataset_id, computed_at, completeness_score, freshness_score, file_health_score, overall_score, row_count, file_count, size_bytes, details
+            FROM quality_metrics WHERE dataset_id = ?1 ORDER BY computed_at DESC
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let metrics = stmt
+        .query_map([dataset_id], |row| {
+            let details_str: Option<String> = row.get(10)?;
+            Ok(QualityMetricResponse {
+                id: row.get(0)?,
+                dataset_id: row.get(1)?,
+                computed_at: row.get(2)?,
+                completeness_score: row.get(3)?,
+                freshness_score: row.get(4)?,
+                file_health_score: row.get(5)?,
+                overall_score: row.get(6)?,
+                row_count: row.get(7)?,
+                file_count: row.get(8)?,
+                size_bytes: row.get(9)?,
+                details: details_str.and_then(|s| serde_json::from_str(&s).ok()),
+            })
+        })
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(dataset = %name, count = metrics.len(), "Listed quality metrics successfully");
+
+    Ok(Json(metrics))
+}
+
+// =============================================================================
+// Freshness Config Handlers
+// =============================================================================
+
+/// Set freshness configuration for a dataset
+async fn set_freshness_config(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Json(req): Json<SetFreshnessConfigRequest>,
+) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, "Setting freshness config");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let grace_period_secs = req.grace_period_secs.unwrap_or(0);
+    let timezone = req.timezone.as_deref().unwrap_or("UTC");
+    let alert_on_stale = req.alert_on_stale.unwrap_or(true);
+    let alert_channels_json = req
+        .alert_channels
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+    // Upsert freshness config
+    conn.execute(
+        r#"
+        INSERT INTO freshness_config (dataset_id, expected_interval_secs, grace_period_secs, timezone, cron_schedule, alert_on_stale, alert_channels, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'), datetime('now'))
+        ON CONFLICT(dataset_id) DO UPDATE SET
+            expected_interval_secs = ?2,
+            grace_period_secs = ?3,
+            timezone = ?4,
+            cron_schedule = ?5,
+            alert_on_stale = ?6,
+            alert_channels = ?7,
+            updated_at = datetime('now')
+        "#,
+        rusqlite::params![
+            dataset_id,
+            req.expected_interval_secs,
+            grace_period_secs,
+            timezone,
+            req.cron_schedule,
+            if alert_on_stale { 1 } else { 0 },
+            alert_channels_json,
+        ],
+    )
+    .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Fetch the config
+    let config = conn
+        .query_row(
+            r#"
+            SELECT id, dataset_id, expected_interval_secs, grace_period_secs, timezone, cron_schedule, alert_on_stale, alert_channels, created_at, updated_at
+            FROM freshness_config WHERE dataset_id = ?1
+            "#,
+            [dataset_id],
+            |row| {
+                let alert_channels_str: Option<String> = row.get(7)?;
+                Ok(FreshnessConfigResponse {
+                    id: row.get(0)?,
+                    dataset_id: row.get(1)?,
+                    expected_interval_secs: row.get(2)?,
+                    grace_period_secs: row.get(3)?,
+                    timezone: row.get(4)?,
+                    cron_schedule: row.get(5)?,
+                    alert_on_stale: row.get::<_, i32>(6)? != 0,
+                    alert_channels: alert_channels_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(dataset = %name, "Freshness config set successfully");
+
+    Ok(Json(config))
+}
+
+/// Get freshness configuration for a dataset
+async fn get_freshness_config(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, "Getting freshness config");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let dataset_id: i64 = conn
+        .query_row("SELECT id FROM datasets WHERE name = ?1", [&name], |row| {
+            row.get(0)
+        })
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let config = conn
+        .query_row(
+            r#"
+            SELECT id, dataset_id, expected_interval_secs, grace_period_secs, timezone, cron_schedule, alert_on_stale, alert_channels, created_at, updated_at
+            FROM freshness_config WHERE dataset_id = ?1
+            "#,
+            [dataset_id],
+            |row| {
+                let alert_channels_str: Option<String> = row.get(7)?;
+                Ok(FreshnessConfigResponse {
+                    id: row.get(0)?,
+                    dataset_id: row.get(1)?,
+                    expected_interval_secs: row.get(2)?,
+                    grace_period_secs: row.get(3)?,
+                    timezone: row.get(4)?,
+                    cron_schedule: row.get(5)?,
+                    alert_on_stale: row.get::<_, i32>(6)? != 0,
+                    alert_channels: alert_channels_str.and_then(|s| serde_json::from_str(&s).ok()),
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Freshness config not found for dataset '{}'", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    Ok(Json(config))
+}
+
+// =============================================================================
+// Delta-Delegated Handlers
+// =============================================================================
+
+/// Get schema from Delta table
+async fn get_dataset_schema(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Query(params): Query<SchemaQueryParams>,
+) -> Result<Json<SchemaResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, version = ?params.version, "Getting dataset schema from Delta");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get delta_location from dataset
+    let delta_location: Option<String> = conn
+        .query_row(
+            "SELECT delta_location FROM datasets WHERE name = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let delta_location = delta_location.ok_or_else(|| {
+        bad_request(
+            format!("Dataset '{}' does not have a delta_location", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get schema from Delta
+    let schema = state
+        .delta_reader
+        .get_schema(&delta_location, params.version)
+        .await
+        .map_err(|e| {
+            internal_error(
+                format!("Failed to read Delta schema: {}", e),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Get current version
+    let metadata = state
+        .delta_reader
+        .get_metadata_cached(&delta_location)
+        .await
+        .map_err(|e| {
+            internal_error(
+                format!("Failed to read Delta metadata: {}", e),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let response = SchemaResponse {
+        dataset_name: name,
+        delta_version: params.version.unwrap_or(metadata.version),
+        schema: serde_json::to_value(&schema).unwrap_or(serde_json::Value::Null),
+        partition_columns: schema.partition_columns,
+    };
+
+    Ok(Json(response))
+}
+
+/// Get stats from Delta table
+async fn get_dataset_stats(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<StatsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, "Getting dataset stats from Delta");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get delta_location from dataset
+    let delta_location: Option<String> = conn
+        .query_row(
+            "SELECT delta_location FROM datasets WHERE name = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let delta_location = delta_location.ok_or_else(|| {
+        bad_request(
+            format!("Dataset '{}' does not have a delta_location", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get metadata from Delta (with caching)
+    let metadata = state
+        .delta_reader
+        .get_metadata_cached(&delta_location)
+        .await
+        .map_err(|e| {
+            internal_error(
+                format!("Failed to read Delta stats: {}", e),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let response = StatsResponse {
+        dataset_name: name,
+        delta_version: metadata.version,
+        row_count: metadata.row_count,
+        size_bytes: metadata.size_bytes,
+        num_files: metadata.num_files,
+        last_modified: Some(metadata.last_modified.to_rfc3339()),
+    };
+
+    Ok(Json(response))
+}
+
+/// Get history from Delta table
+async fn get_dataset_history(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Query(params): Query<HistoryQueryParams>,
+) -> Result<Json<HistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(dataset = %name, limit = ?params.limit, "Getting dataset history from Delta");
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get delta_location from dataset
+    let delta_location: Option<String> = conn
+        .query_row(
+            "SELECT delta_location FROM datasets WHERE name = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let delta_location = delta_location.ok_or_else(|| {
+        bad_request(
+            format!("Dataset '{}' does not have a delta_location", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let limit = params.limit.unwrap_or(10);
+
+    // Get history from Delta
+    let history = state
+        .delta_reader
+        .get_history(&delta_location, limit)
+        .await
+        .map_err(|e| {
+            internal_error(
+                format!("Failed to read Delta history: {}", e),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let versions: Vec<VersionInfo> = history
+        .into_iter()
+        .map(|v| VersionInfo {
+            version: v.version,
+            timestamp: v.timestamp.to_rfc3339(),
+            operation: v.operation,
+            parameters: v.parameters,
+        })
+        .collect();
+
+    let response = HistoryResponse {
+        dataset_name: name,
+        versions,
+    };
+
+    Ok(Json(response))
 }
