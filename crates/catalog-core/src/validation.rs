@@ -23,6 +23,21 @@ pub const MAX_IDENTIFIER_LEN: usize = 100;
 /// Maximum length for FTS search queries
 pub const MAX_SEARCH_QUERY_LEN: usize = 500;
 
+/// Valid governance rule types
+/// NOTE: These must stay in sync with the CHECK constraint in migrations/v1_0_0.rs
+pub const VALID_RULE_TYPES: &[&str] = &[
+    "pii_detection",
+    "retention",
+    "access_control",
+    "custom", // Catch-all for user-defined rules
+];
+
+/// Minimum score value (inclusive)
+pub const MIN_SCORE: f64 = 0.0;
+
+/// Maximum score value (inclusive)
+pub const MAX_SCORE: f64 = 1.0;
+
 /// Validate dataset name
 ///
 /// Requirements:
@@ -203,6 +218,47 @@ pub fn validate_fts_query(query: &str) -> Result<String> {
     Ok(query.to_string())
 }
 
+/// Validate governance rule type
+///
+/// Ensures the rule type is one of the known types:
+/// - pii_detection: Rules for detecting personally identifiable information
+/// - retention: Data retention policy rules
+/// - access_control: Access control rules
+/// - custom: User-defined custom rules (catch-all)
+///
+/// NOTE: These types must match the CHECK constraint in migrations/v1_0_0.rs
+pub fn validate_rule_type(rule_type: &str) -> Result<()> {
+    if !VALID_RULE_TYPES.contains(&rule_type) {
+        return Err(CatalogError::ValidationError(format!(
+            "Invalid rule type '{}'. Valid types: {}",
+            rule_type,
+            VALID_RULE_TYPES.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a quality score value
+///
+/// Ensures the score is between 0.0 and 1.0 (inclusive)
+pub fn validate_score(score: f64, field_name: &str) -> Result<()> {
+    if score.is_nan() {
+        return Err(CatalogError::ValidationError(format!(
+            "{} cannot be NaN",
+            field_name
+        )));
+    }
+
+    if !(MIN_SCORE..=MAX_SCORE).contains(&score) {
+        return Err(CatalogError::ValidationError(format!(
+            "{} must be between {} and {}, got {}",
+            field_name, MIN_SCORE, MAX_SCORE, score
+        )));
+    }
+
+    Ok(())
+}
+
 /// Validate file:// URI path for traversal attacks
 ///
 /// Prevents:
@@ -321,5 +377,38 @@ mod tests {
         assert!(validate_file_uri_path("../../../etc/passwd").is_err()); // Traversal
         assert!(validate_file_uri_path("data/../catalog.db").is_err()); // Traversal
         assert!(validate_file_uri_path("data\0hidden").is_err()); // Null byte
+    }
+
+    #[test]
+    fn test_validate_rule_type() {
+        // Valid rule types (must match DB CHECK constraint)
+        assert!(validate_rule_type("pii_detection").is_ok());
+        assert!(validate_rule_type("retention").is_ok());
+        assert!(validate_rule_type("access_control").is_ok());
+        assert!(validate_rule_type("custom").is_ok());
+
+        // Invalid rule types
+        assert!(validate_rule_type("").is_err());
+        assert!(validate_rule_type("unknown").is_err());
+        assert!(validate_rule_type("PII_DETECTION").is_err()); // Case sensitive
+        assert!(validate_rule_type("pii-detection").is_err()); // Wrong separator
+        assert!(validate_rule_type("data_classification").is_err()); // Not in DB
+    }
+
+    #[test]
+    fn test_validate_score() {
+        // Valid scores
+        assert!(validate_score(0.0, "test").is_ok());
+        assert!(validate_score(0.5, "test").is_ok());
+        assert!(validate_score(1.0, "test").is_ok());
+        assert!(validate_score(0.999, "test").is_ok());
+        assert!(validate_score(0.001, "test").is_ok());
+
+        // Invalid scores
+        assert!(validate_score(-0.1, "test").is_err());
+        assert!(validate_score(1.1, "test").is_err());
+        assert!(validate_score(-1.0, "test").is_err());
+        assert!(validate_score(2.0, "test").is_err());
+        assert!(validate_score(f64::NAN, "test").is_err());
     }
 }
