@@ -2,11 +2,37 @@
 //!
 //! This module is only compiled when the `metrics` feature is enabled.
 //!
-//! Exposed metrics:
+//! ## Global Metrics
 //! - `http_requests_total` - Counter for total HTTP requests
 //! - `http_request_duration_seconds` - Histogram for request latencies
 //! - `catalog_operations_total` - Counter for catalog operations
 //! - `catalog_datasets_total` - Gauge for total datasets in catalog
+//!
+//! ## Multi-Tenant Metrics
+//!
+//! When multi-tenant mode is enabled, additional tenant-labeled metrics are exposed:
+//! - `tenant_http_requests_total` - Counter per tenant
+//! - `tenant_http_request_duration_seconds` - Histogram per tenant
+//! - `tenant_api_calls_total` - Counter per tenant and tier
+//! - `tenant_rate_limit_hits_total` - Counter for rate limit rejections per tenant
+//! - `tenant_backend_cache_hits_total` - Counter for backend cache hits/misses
+//!
+//! ## Connection Pool Metrics
+//!
+//! - `tenant_connection_wait_seconds` - Histogram for permit wait times
+//! - `tenant_active_connections` - Gauge for active connections per tenant
+//! - `tenant_connection_timeouts_total` - Counter for acquire timeouts
+//! - `tenant_circuit_breaker_state` - Gauge for circuit breaker state (0=closed, 1=open)
+//! - `tenant_circuit_breaker_trips_total` - Counter for circuit breaker trips
+//!
+//! ## Cardinality Warning
+//!
+//! Per-tenant metrics (those with `tenant_id` label) create a new Prometheus time series
+//! for each unique tenant. In deployments with a large number of tenants (>1000), this
+//! can lead to high memory usage and slow metric queries. Consider:
+//! - Aggregating metrics at the tier level instead of tenant level
+//! - Using metric relabeling to drop high-cardinality labels
+//! - Implementing tenant metric rotation for inactive tenants
 
 use axum::{
     extract::{MatchedPath, Request},
@@ -16,12 +42,16 @@ use axum::{
 };
 use lazy_static::lazy_static;
 use prometheus::{
-    register_counter_vec, register_gauge, register_histogram_vec, CounterVec, Encoder, Gauge,
-    HistogramVec, TextEncoder,
+    register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec, CounterVec,
+    Encoder, Gauge, GaugeVec, HistogramVec, TextEncoder,
 };
 use std::time::Instant;
 
 lazy_static! {
+    // ==========================================================================
+    // Global Metrics (backward compatible)
+    // ==========================================================================
+
     /// Counter for total HTTP requests by method, path, and status
     pub static ref HTTP_REQUESTS_TOTAL: CounterVec = register_counter_vec!(
         "http_requests_total",
@@ -53,9 +83,131 @@ lazy_static! {
         "Total number of datasets in the catalog"
     )
     .unwrap();
+
+    // ==========================================================================
+    // Multi-Tenant Metrics
+    // ==========================================================================
+
+    /// Counter for HTTP requests per tenant
+    pub static ref TENANT_HTTP_REQUESTS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_http_requests_total",
+        "Total HTTP requests per tenant",
+        &["tenant_id", "method", "path", "status"]
+    )
+    .unwrap();
+
+    /// Histogram for HTTP request duration per tenant
+    pub static ref TENANT_HTTP_REQUEST_DURATION_SECONDS: HistogramVec = register_histogram_vec!(
+        "tenant_http_request_duration_seconds",
+        "HTTP request latency per tenant in seconds",
+        &["tenant_id", "method", "path"],
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// Counter for API calls per tenant and tier
+    pub static ref TENANT_API_CALLS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_api_calls_total",
+        "Total API calls per tenant with tier label",
+        &["tenant_id", "tier", "operation"]
+    )
+    .unwrap();
+
+    /// Counter for rate limit hits per tenant
+    pub static ref TENANT_RATE_LIMIT_HITS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_rate_limit_hits_total",
+        "Rate limit rejections per tenant",
+        &["tenant_id", "tier"]
+    )
+    .unwrap();
+
+    /// Counter for tenant backend cache operations
+    pub static ref TENANT_BACKEND_CACHE_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_backend_cache_total",
+        "Tenant backend cache hits and misses",
+        &["result"]  // "hit" or "miss"
+    )
+    .unwrap();
+
+    /// Gauge for current number of cached tenant backends
+    pub static ref TENANT_BACKEND_CACHE_SIZE: Gauge = register_gauge!(
+        "tenant_backend_cache_size",
+        "Current number of cached tenant backends"
+    )
+    .unwrap();
+
+    /// Gauge for datasets per tenant
+    pub static ref TENANT_DATASETS_TOTAL: GaugeVec = register_gauge_vec!(
+        "tenant_datasets_total",
+        "Total datasets per tenant",
+        &["tenant_id"]
+    )
+    .unwrap();
+
+    /// Counter for tenant lifecycle events
+    pub static ref TENANT_LIFECYCLE_EVENTS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_lifecycle_events_total",
+        "Tenant lifecycle events",
+        &["event"]  // "created", "suspended", "reactivated", "deleted", "purged"
+    )
+    .unwrap();
+
+    // ==========================================================================
+    // Connection Pool Metrics
+    // ==========================================================================
+
+    /// Histogram for connection permit wait times per tenant
+    pub static ref TENANT_CONNECTION_WAIT_SECONDS: HistogramVec = register_histogram_vec!(
+        "tenant_connection_wait_seconds",
+        "Time spent waiting for a connection permit",
+        &["tenant_id"],
+        vec![0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0]
+    )
+    .unwrap();
+
+    /// Gauge for active connections per tenant
+    pub static ref TENANT_ACTIVE_CONNECTIONS: GaugeVec = register_gauge_vec!(
+        "tenant_active_connections",
+        "Current number of active connections per tenant",
+        &["tenant_id"]
+    )
+    .unwrap();
+
+    /// Counter for connection acquire timeouts per tenant
+    pub static ref TENANT_CONNECTION_TIMEOUTS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_connection_timeouts_total",
+        "Total connection acquire timeouts per tenant",
+        &["tenant_id"]
+    )
+    .unwrap();
+
+    /// Gauge for circuit breaker state per tenant (0=closed, 1=open)
+    pub static ref TENANT_CIRCUIT_BREAKER_STATE: GaugeVec = register_gauge_vec!(
+        "tenant_circuit_breaker_state",
+        "Circuit breaker state per tenant (0=closed, 1=open)",
+        &["tenant_id"]
+    )
+    .unwrap();
+
+    /// Counter for circuit breaker trips per tenant
+    pub static ref TENANT_CIRCUIT_BREAKER_TRIPS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_circuit_breaker_trips_total",
+        "Total circuit breaker trips per tenant",
+        &["tenant_id"]
+    )
+    .unwrap();
+}
+
+/// Tenant info extracted from request for metrics
+#[derive(Clone, Debug)]
+pub struct TenantMetricsInfo {
+    pub tenant_id: String,
+    pub tier: String,
 }
 
 /// Axum middleware to track HTTP request metrics
+///
+/// Records both global and tenant-specific metrics when tenant info is available.
 pub async fn track_metrics(req: Request, next: Next) -> impl IntoResponse {
     let start = Instant::now();
     let method = req.method().to_string();
@@ -65,11 +217,14 @@ pub async fn track_metrics(req: Request, next: Next) -> impl IntoResponse {
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
 
+    // Extract tenant info if present
+    let tenant_info = req.extensions().get::<TenantMetricsInfo>().cloned();
+
     let response = next.run(req).await;
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
 
-    // Record metrics
+    // Record global metrics (always)
     HTTP_REQUESTS_TOTAL
         .with_label_values(&[&method, &path, &status])
         .inc();
@@ -77,6 +232,17 @@ pub async fn track_metrics(req: Request, next: Next) -> impl IntoResponse {
     HTTP_REQUEST_DURATION_SECONDS
         .with_label_values(&[&method, &path])
         .observe(duration);
+
+    // Record tenant-specific metrics if tenant info is available
+    if let Some(info) = tenant_info {
+        TENANT_HTTP_REQUESTS_TOTAL
+            .with_label_values(&[&info.tenant_id, &method, &path, &status])
+            .inc();
+
+        TENANT_HTTP_REQUEST_DURATION_SECONDS
+            .with_label_values(&[&info.tenant_id, &method, &path])
+            .observe(duration);
+    }
 
     response
 }
@@ -113,4 +279,118 @@ pub fn record_catalog_operation(operation: &str, status: &str) {
 #[allow(dead_code)]
 pub fn update_datasets_total(count: i64) {
     CATALOG_DATASETS_TOTAL.set(count as f64);
+}
+
+// =============================================================================
+// Multi-Tenant Metrics Helper Functions
+// =============================================================================
+
+/// Record a tenant API call
+pub fn record_tenant_api_call(tenant_id: &str, tier: &str, operation: &str) {
+    TENANT_API_CALLS_TOTAL
+        .with_label_values(&[tenant_id, tier, operation])
+        .inc();
+}
+
+/// Record a tenant rate limit hit
+pub fn record_tenant_rate_limit_hit(tenant_id: &str, tier: &str) {
+    TENANT_RATE_LIMIT_HITS_TOTAL
+        .with_label_values(&[tenant_id, tier])
+        .inc();
+}
+
+/// Record a tenant backend cache hit
+pub fn record_tenant_backend_cache_hit() {
+    TENANT_BACKEND_CACHE_TOTAL.with_label_values(&["hit"]).inc();
+}
+
+/// Record a tenant backend cache miss
+pub fn record_tenant_backend_cache_miss() {
+    TENANT_BACKEND_CACHE_TOTAL
+        .with_label_values(&["miss"])
+        .inc();
+}
+
+/// Update the tenant backend cache size gauge
+pub fn update_tenant_backend_cache_size(size: usize) {
+    TENANT_BACKEND_CACHE_SIZE.set(size as f64);
+}
+
+/// Update the datasets count for a specific tenant
+pub fn update_tenant_datasets_total(tenant_id: &str, count: i64) {
+    TENANT_DATASETS_TOTAL
+        .with_label_values(&[tenant_id])
+        .set(count as f64);
+}
+
+/// Record a tenant lifecycle event
+pub fn record_tenant_lifecycle_event(event: &str) {
+    TENANT_LIFECYCLE_EVENTS_TOTAL
+        .with_label_values(&[event])
+        .inc();
+}
+
+/// Convenience function to record tenant creation
+pub fn record_tenant_created() {
+    record_tenant_lifecycle_event("created");
+}
+
+/// Convenience function to record tenant suspension
+pub fn record_tenant_suspended() {
+    record_tenant_lifecycle_event("suspended");
+}
+
+/// Convenience function to record tenant reactivation
+pub fn record_tenant_reactivated() {
+    record_tenant_lifecycle_event("reactivated");
+}
+
+/// Convenience function to record tenant deletion
+pub fn record_tenant_deleted() {
+    record_tenant_lifecycle_event("deleted");
+}
+
+/// Convenience function to record tenant purge
+pub fn record_tenant_purged() {
+    record_tenant_lifecycle_event("purged");
+}
+
+// =============================================================================
+// Connection Pool Metrics Helper Functions
+// =============================================================================
+
+/// Record time spent waiting for a connection permit
+pub fn record_connection_wait_time(tenant_id: &str, duration_secs: f64) {
+    TENANT_CONNECTION_WAIT_SECONDS
+        .with_label_values(&[tenant_id])
+        .observe(duration_secs);
+}
+
+/// Update the active connection count for a tenant
+pub fn update_active_connections(tenant_id: &str, count: usize) {
+    TENANT_ACTIVE_CONNECTIONS
+        .with_label_values(&[tenant_id])
+        .set(count as f64);
+}
+
+/// Record a connection acquire timeout
+pub fn record_connection_timeout(tenant_id: &str) {
+    TENANT_CONNECTION_TIMEOUTS_TOTAL
+        .with_label_values(&[tenant_id])
+        .inc();
+}
+
+/// Update circuit breaker state for a tenant (false=closed, true=open)
+pub fn update_circuit_breaker_state(tenant_id: &str, is_open: bool) {
+    TENANT_CIRCUIT_BREAKER_STATE
+        .with_label_values(&[tenant_id])
+        .set(if is_open { 1.0 } else { 0.0 });
+}
+
+/// Record a circuit breaker trip
+pub fn record_circuit_breaker_trip(tenant_id: &str) {
+    TENANT_CIRCUIT_BREAKER_TRIPS_TOTAL
+        .with_label_values(&[tenant_id])
+        .inc();
+    update_circuit_breaker_state(tenant_id, true);
 }

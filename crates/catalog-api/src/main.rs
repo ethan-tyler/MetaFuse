@@ -70,6 +70,38 @@ impl Clone for AppState {
     }
 }
 
+/// Identity context for audit logging
+/// Extracted from request extensions - includes API key identity and client IP
+/// Always available to handlers; enrich_event only active with audit feature
+#[derive(Debug, Clone, Default)]
+struct AuditContext {
+    api_key_id: Option<String>,
+    client_ip: Option<String>,
+}
+
+impl AuditContext {
+    /// Create new audit context with optional API key and client IP
+    fn new(api_key_id: Option<String>, client_ip: Option<String>) -> Self {
+        Self {
+            api_key_id,
+            client_ip,
+        }
+    }
+
+    /// Enrich an audit event with identity context
+    #[cfg(feature = "audit")]
+    fn enrich_event(&self, event: audit::AuditEvent) -> audit::AuditEvent {
+        let event = match &self.api_key_id {
+            Some(key_id) => event.with_actor(key_id, audit::ActorType::Service),
+            None => event.with_actor("anonymous", audit::ActorType::Anonymous),
+        };
+        match &self.client_ip {
+            Some(ip) => event.with_client_ip(ip),
+            None => event,
+        }
+    }
+}
+
 /// Dataset response structure
 #[derive(Debug, Serialize, Deserialize)]
 struct DatasetResponse {
@@ -163,6 +195,24 @@ struct UpdateOwnerRequest {
     contact_info: Option<serde_json::Value>,
 }
 
+/// Request to create a new domain
+#[derive(Debug, Deserialize)]
+struct CreateDomainRequest {
+    name: String,
+    display_name: String,
+    description: Option<String>,
+    owner_id: Option<String>,
+}
+
+/// Request to update an existing domain
+#[derive(Debug, Deserialize)]
+struct UpdateDomainRequest {
+    display_name: Option<String>,
+    description: Option<String>,
+    owner_id: Option<String>,
+    is_active: Option<bool>,
+}
+
 /// Request to create a lineage edge
 #[derive(Debug, Deserialize)]
 struct CreateLineageEdgeRequest {
@@ -245,6 +295,81 @@ struct OwnerResponse {
     updated_at: String,
 }
 
+/// Domain response structure
+#[derive(Debug, Serialize)]
+struct DomainResponse {
+    id: i64,
+    name: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
+    is_active: bool,
+    dataset_count: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Request to create a glossary term
+#[derive(Debug, Deserialize)]
+struct CreateGlossaryTermRequest {
+    term: String,
+    description: Option<String>,
+    domain: Option<String>,
+    owner_id: Option<String>,
+    status: Option<String>,
+}
+
+/// Request to update a glossary term
+#[derive(Debug, Deserialize)]
+struct UpdateGlossaryTermRequest {
+    term: Option<String>,
+    description: Option<String>,
+    domain: Option<String>,
+    owner_id: Option<String>,
+    status: Option<String>,
+}
+
+/// Request to link a term to a dataset or field
+#[derive(Debug, Deserialize)]
+struct LinkTermRequest {
+    dataset_id: Option<i64>,
+    field_id: Option<i64>,
+}
+
+/// Glossary term response structure
+#[derive(Debug, Serialize)]
+struct GlossaryTermResponse {
+    id: i64,
+    term: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    domain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner_id: Option<String>,
+    status: String,
+    link_count: i64,
+    created_at: String,
+    updated_at: String,
+}
+
+/// Term link response structure
+#[derive(Debug, Serialize)]
+struct TermLinkResponse {
+    id: i64,
+    term_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dataset_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_name: Option<String>,
+}
+
 /// Governance rule response structure
 #[derive(Debug, Serialize)]
 struct GovernanceRuleResponse {
@@ -312,6 +437,37 @@ struct SchemaResponse {
     partition_columns: Vec<String>,
 }
 
+/// Schema diff response from Delta table
+#[derive(Debug, Serialize)]
+struct SchemaDiffResponse {
+    dataset_name: String,
+    from_version: i64,
+    to_version: i64,
+    added_columns: Vec<SchemaDiffField>,
+    removed_columns: Vec<SchemaDiffField>,
+    modified_columns: Vec<SchemaDiffFieldChange>,
+}
+
+/// Field info for schema diff response
+#[derive(Debug, Serialize)]
+struct SchemaDiffField {
+    name: String,
+    data_type: String,
+    nullable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+/// Field change info for schema diff response
+#[derive(Debug, Serialize)]
+struct SchemaDiffFieldChange {
+    name: String,
+    old_type: String,
+    new_type: String,
+    old_nullable: bool,
+    new_nullable: bool,
+}
+
 /// Stats response from Delta table
 #[derive(Debug, Serialize)]
 struct StatsResponse {
@@ -347,6 +503,13 @@ struct VersionInfo {
 #[derive(Debug, Deserialize)]
 struct SchemaQueryParams {
     version: Option<i64>,
+}
+
+/// Query params for schema diff endpoint
+#[derive(Debug, Deserialize)]
+struct SchemaDiffQueryParams {
+    from: i64,
+    to: i64,
 }
 
 /// Query params for history endpoint
@@ -596,6 +759,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/datasets/:name/tags/remove", post(remove_tags))
         // Delta-delegated endpoints
         .route("/api/v1/datasets/:name/schema", get(get_dataset_schema))
+        .route(
+            "/api/v1/datasets/:name/schema/diff",
+            get(get_dataset_schema_diff),
+        )
         .route("/api/v1/datasets/:name/stats", get(get_dataset_stats))
         .route("/api/v1/datasets/:name/history", get(get_dataset_history))
         // Quality metrics endpoints
@@ -613,6 +780,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/v1/owners/:id",
             get(get_owner).put(update_owner).delete(delete_owner),
+        )
+        // Domain endpoints
+        .route("/api/v1/domains", get(list_domains).post(create_domain))
+        .route(
+            "/api/v1/domains/:name",
+            get(get_domain).put(update_domain).delete(delete_domain),
+        )
+        .route("/api/v1/domains/:name/datasets", get(list_domain_datasets))
+        // Glossary endpoints
+        .route(
+            "/api/v1/glossary",
+            get(list_glossary_terms).post(create_glossary_term),
+        )
+        .route(
+            "/api/v1/glossary/:id",
+            get(get_glossary_term)
+                .put(update_glossary_term)
+                .delete(delete_glossary_term),
+        )
+        .route(
+            "/api/v1/glossary/:id/links",
+            get(get_term_links).post(link_term).delete(unlink_term),
         )
         // Lineage endpoint
         .route("/api/v1/lineage", post(create_lineage_edge))
@@ -697,6 +886,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .layer(middleware::from_fn(rate_limiting::rate_limit_middleware))
     };
 
+    // Add audit context middleware to extract identity for audit logging
+    // Always run to make AuditContext available to handlers
+    let app = app.layer(middleware::from_fn(audit_context_middleware));
+
     let app = app.layer(CorsLayer::permissive()).with_state(state);
 
     // Get port from environment or use default
@@ -745,6 +938,57 @@ async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     }
     .instrument(span)
     .await
+}
+
+/// Middleware to extract audit context (API key identity + client IP)
+/// Must run after auth middleware so ApiKeyId is available in extensions
+/// Always runs to make AuditContext available to all handlers
+async fn audit_context_middleware(mut req: Request, next: Next) -> Response {
+    // Extract API key ID if present (set by auth/rate-limiting middleware)
+    #[cfg(feature = "rate-limiting")]
+    let api_key_id = req
+        .extensions()
+        .get::<rate_limiting::ApiKeyId>()
+        .map(|k| k.id.clone());
+    #[cfg(not(feature = "rate-limiting"))]
+    let api_key_id: Option<String> = None;
+
+    // Extract client IP from headers (X-Forwarded-For, X-Real-IP) or connection
+    let client_ip = extract_client_ip(&req);
+
+    // Create and insert audit context
+    let audit_context = AuditContext::new(api_key_id, client_ip);
+    req.extensions_mut().insert(audit_context);
+
+    next.run(req).await
+}
+
+/// Extract client IP from request headers or connection info
+fn extract_client_ip(req: &Request) -> Option<String> {
+    // Try X-Forwarded-For first (may contain multiple IPs, take the first)
+    if let Some(forwarded) = req.headers().get("x-forwarded-for") {
+        if let Ok(value) = forwarded.to_str() {
+            if let Some(first_ip) = value.split(',').next() {
+                let ip = first_ip.trim();
+                if !ip.is_empty() {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+    }
+
+    // Try X-Real-IP
+    if let Some(real_ip) = req.headers().get("x-real-ip") {
+        if let Ok(value) = real_ip.to_str() {
+            let ip = value.trim();
+            if !ip.is_empty() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+
+    // Fallback: could extract from connection info but axum doesn't expose it directly here
+    None
 }
 
 /// Health check endpoint
@@ -1918,6 +2162,7 @@ fn parse_partition_keys(raw: Option<String>) -> Vec<String> {
 async fn create_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Json(req): Json<CreateDatasetRequest>,
 ) -> Result<(StatusCode, Json<DatasetResponse>), (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(name = %req.name, "Creating dataset");
@@ -2061,16 +2306,103 @@ async fn create_dataset(
             }),
             &request_id.0,
         );
-        state.audit_logger.log(event);
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    // Auto-classification trigger (opt-in via METAFUSE_CLASSIFICATION_AUTO_SCAN)
+    #[cfg(feature = "classification")]
+    {
+        let auto_scan_enabled = std::env::var("METAFUSE_CLASSIFICATION_AUTO_SCAN")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        if auto_scan_enabled {
+            let dataset_id = dataset.id;
+            let dataset_name = dataset.name.clone();
+            let backend = state.backend.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) = auto_classify_dataset(&backend, dataset_id).await {
+                    tracing::warn!(
+                        dataset_id,
+                        dataset_name = %dataset_name,
+                        error = %e,
+                        "Auto-classification failed"
+                    );
+                }
+            });
+        }
     }
 
     Ok((StatusCode::CREATED, Json(dataset)))
+}
+
+/// Auto-classify a dataset's fields (background task)
+#[cfg(feature = "classification")]
+async fn auto_classify_dataset(
+    backend: &Arc<DynCatalogBackend>,
+    dataset_id: i64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::classification::{Classification, ClassificationEngine};
+
+    let conn = backend.get_connection().await?;
+
+    // Load classification engine with rules
+    let engine = ClassificationEngine::load_from_db(&conn)?;
+
+    // Get fields for this dataset
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, name, data_type
+        FROM fields
+        WHERE dataset_id = ?1
+        "#,
+    )?;
+
+    let fields: Vec<(i64, String, String)> = stmt
+        .query_map([dataset_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if fields.is_empty() {
+        tracing::debug!(dataset_id, "No fields to classify");
+        return Ok(());
+    }
+
+    let mut classified_count = 0;
+    let mut pii_count = 0;
+
+    for (field_id, field_name, data_type) in fields {
+        let classification = engine.classify_column(&field_name, &data_type);
+
+        // Store classification
+        classification::store_classification(&conn, field_id, &classification)?;
+
+        classified_count += 1;
+        if classification.classification != Classification::Unknown
+            && classification.classification != Classification::Public
+        {
+            pii_count += 1;
+        }
+    }
+
+    tracing::info!(
+        dataset_id,
+        classified_count,
+        pii_count,
+        "Auto-classification completed"
+    );
+
+    Ok(())
 }
 
 /// Update an existing dataset
 async fn update_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(name): Path<String>,
     Json(req): Json<UpdateDatasetRequest>,
 ) -> Result<Json<DatasetResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -2215,7 +2547,7 @@ async fn update_dataset(
             }),
             &request_id.0,
         );
-        state.audit_logger.log(event);
+        state.audit_logger.log(audit_context.enrich_event(event));
     }
 
     Ok(Json(dataset))
@@ -2225,6 +2557,7 @@ async fn update_dataset(
 async fn delete_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(name = %name, "Deleting dataset");
@@ -2272,7 +2605,7 @@ async fn delete_dataset(
             serde_json::json!({ "name": name }),
             &request_id.0,
         );
-        state.audit_logger.log(event);
+        state.audit_logger.log(audit_context.enrich_event(event));
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -2282,6 +2615,7 @@ async fn delete_dataset(
 async fn add_tags(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(name): Path<String>,
     Json(req): Json<AddTagsRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
@@ -2328,6 +2662,22 @@ async fn add_tags(
 
     tracing::info!(name = %name, added = req.tags.len(), "Tags added successfully");
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "dataset_tags",
+            &name,
+            serde_json::json!({}),
+            serde_json::json!({
+                "action": "add",
+                "tags": req.tags,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
     Ok(Json(tags))
 }
 
@@ -2335,6 +2685,7 @@ async fn add_tags(
 async fn remove_tags(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(name): Path<String>,
     Json(req): Json<RemoveTagsRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
@@ -2381,6 +2732,22 @@ async fn remove_tags(
 
     tracing::info!(name = %name, removed = req.tags.len(), "Tags removed successfully");
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "dataset_tags",
+            &name,
+            serde_json::json!({
+                "action": "remove",
+                "tags": req.tags,
+            }),
+            serde_json::json!({}),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
     Ok(Json(tags))
 }
 
@@ -2392,6 +2759,7 @@ async fn remove_tags(
 async fn create_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Json(req): Json<CreateOwnerRequest>,
 ) -> Result<(StatusCode, Json<OwnerResponse>), (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(owner_id = %req.owner_id, "Creating owner");
@@ -2445,6 +2813,23 @@ async fn create_owner(
     };
 
     tracing::info!(owner_id = %owner.owner_id, "Owner created successfully");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "owner",
+            &owner.owner_id,
+            serde_json::json!({
+                "id": owner.id,
+                "owner_id": owner.owner_id,
+                "name": owner.name,
+                "owner_type": owner.owner_type,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
 
     Ok((StatusCode::CREATED, Json(owner)))
 }
@@ -2548,6 +2933,7 @@ async fn get_owner(
 async fn update_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(id): Path<String>,
     Json(req): Json<UpdateOwnerRequest>,
 ) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -2630,6 +3016,23 @@ async fn update_owner(
 
     tracing::info!(owner_id = %id, "Owner updated successfully");
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "owner",
+            &id,
+            serde_json::json!({}), // old values not tracked for simplicity
+            serde_json::json!({
+                "id": owner.id,
+                "owner_id": owner.owner_id,
+                "name": owner.name,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
     Ok(Json(owner))
 }
 
@@ -2637,6 +3040,7 @@ async fn update_owner(
 async fn delete_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(owner_id = %id, "Deleting owner");
@@ -2660,6 +3064,1169 @@ async fn delete_owner(
 
     tracing::info!(owner_id = %id, "Owner deleted successfully");
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "owner",
+            &id,
+            serde_json::json!({ "owner_id": id }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// =============================================================================
+// Domain Handlers
+// =============================================================================
+
+/// List all domains
+async fn list_domains(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<DomainResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!("Listing domains");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let offset = params.offset.unwrap_or(0);
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT d.id, d.name, d.display_name, d.description, d.owner_id,
+                   d.is_active, d.created_at, d.updated_at,
+                   (SELECT COUNT(*) FROM datasets WHERE domain = d.name) as dataset_count
+            FROM domains d
+            WHERE d.is_active = 1
+            ORDER BY d.name
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let domains: Vec<DomainResponse> = stmt
+        .query_map([limit as i64, offset as i64], |row| {
+            Ok(DomainResponse {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                display_name: row.get(2)?,
+                description: row.get(3)?,
+                owner_id: row.get(4)?,
+                is_active: row.get::<_, i32>(5)? == 1,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                dataset_count: row.get(8)?,
+            })
+        })
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(domains))
+}
+
+/// Create a new domain
+async fn create_domain(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Json(req): Json<CreateDomainRequest>,
+) -> Result<(StatusCode, Json<DomainResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %req.name, "Creating domain");
+
+    // Validate domain name (lowercase alphanumeric with hyphens/underscores)
+    if !req
+        .name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(bad_request(
+            "Domain name must be lowercase alphanumeric with hyphens or underscores".to_string(),
+            request_id.0.clone(),
+        ));
+    }
+
+    if req.name.is_empty() || req.name.len() > 64 {
+        return Err(bad_request(
+            "Domain name must be 1-64 characters".to_string(),
+            request_id.0.clone(),
+        ));
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Insert domain
+    conn.execute(
+        r#"
+        INSERT INTO domains (name, display_name, description, owner_id, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'))
+        "#,
+        rusqlite::params![req.name, req.display_name, req.description, req.owner_id],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            bad_request(
+                format!("Domain '{}' already exists", req.name),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
+
+    // Fetch the created domain
+    let domain: DomainResponse = conn
+        .query_row(
+            r#"
+            SELECT id, name, display_name, description, owner_id, is_active, created_at, updated_at
+            FROM domains WHERE name = ?1
+            "#,
+            [&req.name],
+            |row| {
+                Ok(DomainResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    display_name: row.get(2)?,
+                    description: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    is_active: row.get::<_, i32>(5)? == 1,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    dataset_count: 0,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(name = %req.name, id = domain.id, "Domain created successfully");
+
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "domain",
+            &domain.name,
+            serde_json::json!({
+                "id": domain.id,
+                "name": domain.name,
+                "display_name": domain.display_name,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok((StatusCode::CREATED, Json(domain)))
+}
+
+/// Get a domain by name
+async fn get_domain(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+) -> Result<Json<DomainResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, "Getting domain");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let domain: DomainResponse = conn
+        .query_row(
+            r#"
+            SELECT d.id, d.name, d.display_name, d.description, d.owner_id,
+                   d.is_active, d.created_at, d.updated_at,
+                   (SELECT COUNT(*) FROM datasets WHERE domain = d.name) as dataset_count
+            FROM domains d
+            WHERE d.name = ?1
+            "#,
+            [&name],
+            |row| {
+                Ok(DomainResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    display_name: row.get(2)?,
+                    description: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    is_active: row.get::<_, i32>(5)? == 1,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    dataset_count: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|_| not_found(format!("Domain '{}' not found", name), request_id.0.clone()))?;
+
+    Ok(Json(domain))
+}
+
+/// Update a domain
+async fn update_domain(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateDomainRequest>,
+) -> Result<Json<DomainResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, "Updating domain");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Build dynamic update query
+    let mut updates = vec!["updated_at = datetime('now')".to_string()];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+    if let Some(display_name) = &req.display_name {
+        updates.push(format!("display_name = ?{}", params.len() + 1));
+        params.push(Box::new(display_name.clone()));
+    }
+    if let Some(description) = &req.description {
+        updates.push(format!("description = ?{}", params.len() + 1));
+        params.push(Box::new(description.clone()));
+    }
+    if let Some(owner_id) = &req.owner_id {
+        updates.push(format!("owner_id = ?{}", params.len() + 1));
+        params.push(Box::new(owner_id.clone()));
+    }
+    if let Some(is_active) = req.is_active {
+        updates.push(format!("is_active = ?{}", params.len() + 1));
+        params.push(Box::new(if is_active { 1i32 } else { 0i32 }));
+    }
+
+    params.push(Box::new(name.clone()));
+    let sql = format!(
+        "UPDATE domains SET {} WHERE name = ?{}",
+        updates.join(", "),
+        params.len()
+    );
+
+    let rows_updated = conn
+        .execute(&sql, params_from_iter(params.iter().map(|p| p.as_ref())))
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows_updated == 0 {
+        return Err(not_found(
+            format!("Domain '{}' not found", name),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Fetch updated domain
+    let domain: DomainResponse = conn
+        .query_row(
+            r#"
+            SELECT d.id, d.name, d.display_name, d.description, d.owner_id,
+                   d.is_active, d.created_at, d.updated_at,
+                   (SELECT COUNT(*) FROM datasets WHERE domain = d.name) as dataset_count
+            FROM domains d
+            WHERE d.name = ?1
+            "#,
+            [&name],
+            |row| {
+                Ok(DomainResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    display_name: row.get(2)?,
+                    description: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    is_active: row.get::<_, i32>(5)? == 1,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    dataset_count: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(name = %name, "Domain updated successfully");
+
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "domain",
+            &domain.name,
+            serde_json::json!({}),
+            serde_json::json!({
+                "display_name": domain.display_name,
+                "description": domain.description,
+                "owner_id": domain.owner_id,
+                "is_active": domain.is_active,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok(Json(domain))
+}
+
+/// Delete (soft delete) a domain
+async fn delete_domain(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(name = %name, "Deleting domain");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Check for datasets in this domain (warning only, soft delete still proceeds)
+    let dataset_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM datasets WHERE domain = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if dataset_count > 0 {
+        tracing::warn!(
+            domain = %name,
+            dataset_count,
+            "Soft-deleting domain with existing datasets"
+        );
+    }
+
+    // Soft delete - set is_active = 0
+    let rows_updated = conn
+        .execute(
+            "UPDATE domains SET is_active = 0, updated_at = datetime('now') WHERE name = ?1 AND is_active = 1",
+            [&name],
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows_updated == 0 {
+        return Err(not_found(
+            format!("Domain '{}' not found", name),
+            request_id.0.clone(),
+        ));
+    }
+
+    tracing::info!(name = %name, dataset_count, "Domain deleted (soft delete)");
+
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "domain",
+            &name,
+            serde_json::json!({"name": name}),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List datasets in a domain
+async fn list_domain_datasets(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(domain = %name, "Listing datasets in domain");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Verify domain exists
+    let domain_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM domains WHERE name = ?1 AND is_active = 1",
+            [&name],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if !domain_exists {
+        return Err(not_found(
+            format!("Domain '{}' not found", name),
+            request_id.0.clone(),
+        ));
+    }
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let offset = params.offset.unwrap_or(0);
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, name, path, format, delta_location, description, tenant, domain, owner,
+                   created_at, last_updated, row_count, size_bytes, partition_keys
+            FROM datasets
+            WHERE domain = ?1
+            ORDER BY name
+            LIMIT ?2 OFFSET ?3
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let datasets: Vec<DatasetResponse> = stmt
+        .query_map(
+            rusqlite::params![name, limit as i64, offset as i64],
+            |row| {
+                let row_count: Option<i64> = row.get(11)?;
+                let size_bytes: Option<i64> = row.get(12)?;
+                let partition_keys = parse_partition_keys(row.get::<_, Option<String>>(13)?);
+                Ok(DatasetResponse {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    format: row.get(3)?,
+                    delta_location: row.get(4)?,
+                    description: row.get(5)?,
+                    tenant: row.get(6)?,
+                    domain: row.get(7)?,
+                    owner: row.get(8)?,
+                    created_at: row.get(9)?,
+                    last_updated: row.get(10)?,
+                    operational: OperationalMetaResponse {
+                        row_count,
+                        size_bytes,
+                        partition_keys,
+                    },
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(datasets))
+}
+
+// =============================================================================
+// Glossary Handlers
+// =============================================================================
+
+/// List all glossary terms with optional filters
+async fn list_glossary_terms(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Query(params): Query<PaginationParams>,
+) -> Result<Json<Vec<GlossaryTermResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!("Listing glossary terms");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let limit = params.limit.unwrap_or(100).min(1000);
+    let offset = params.offset.unwrap_or(0);
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                gt.id, gt.term, gt.description, gt.domain, gt.owner_id,
+                COALESCE(gt.status, 'draft') as status,
+                COALESCE(gt.created_at, datetime('now')) as created_at,
+                COALESCE(gt.updated_at, datetime('now')) as updated_at,
+                COUNT(tl.id) as link_count
+            FROM glossary_terms gt
+            LEFT JOIN term_links tl ON gt.id = tl.term_id
+            GROUP BY gt.id
+            ORDER BY gt.term
+            LIMIT ?1 OFFSET ?2
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let terms: Vec<GlossaryTermResponse> = stmt
+        .query_map(rusqlite::params![limit as i64, offset as i64], |row| {
+            Ok(GlossaryTermResponse {
+                id: row.get(0)?,
+                term: row.get(1)?,
+                description: row.get(2)?,
+                domain: row.get(3)?,
+                owner_id: row.get(4)?,
+                status: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                link_count: row.get(8)?,
+            })
+        })
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(terms))
+}
+
+/// Create a new glossary term
+async fn create_glossary_term(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Json(req): Json<CreateGlossaryTermRequest>,
+) -> Result<(StatusCode, Json<GlossaryTermResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(term = %req.term, "Creating glossary term");
+
+    // Validate term
+    if req.term.trim().is_empty() {
+        return Err(bad_request(
+            "Term cannot be empty".to_string(),
+            request_id.0.clone(),
+        ));
+    }
+
+    if req.term.len() > 255 {
+        return Err(bad_request(
+            "Term must be 255 characters or less".to_string(),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Validate status if provided
+    if let Some(ref status) = req.status {
+        let valid_statuses = ["draft", "approved", "deprecated"];
+        if !valid_statuses.contains(&status.as_str()) {
+            return Err(bad_request(
+                format!(
+                    "Invalid status '{}'. Must be one of: draft, approved, deprecated",
+                    status
+                ),
+                request_id.0.clone(),
+            ));
+        }
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let status = req.status.unwrap_or_else(|| "draft".to_string());
+
+    conn.execute(
+        r#"
+        INSERT INTO glossary_terms (term, description, domain, owner_id, status, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), datetime('now'))
+        "#,
+        rusqlite::params![req.term, req.description, req.domain, req.owner_id, status],
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            bad_request(
+                format!("Glossary term '{}' already exists", req.term),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
+
+    let id = conn.last_insert_rowid();
+
+    let term_response = GlossaryTermResponse {
+        id,
+        term: req.term.clone(),
+        description: req.description.clone(),
+        domain: req.domain.clone(),
+        owner_id: req.owner_id.clone(),
+        status: status.clone(),
+        link_count: 0,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    tracing::info!(term = %req.term, id, "Glossary term created");
+
+    // Emit audit event
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "glossary_term",
+            req.term.clone(),
+            serde_json::json!({
+                "id": id,
+                "term": req.term,
+                "domain": req.domain,
+                "status": status,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok((StatusCode::CREATED, Json(term_response)))
+}
+
+/// Get a glossary term by ID
+async fn get_glossary_term(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<i64>,
+) -> Result<Json<GlossaryTermResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(id, "Getting glossary term");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let term = conn
+        .query_row(
+            r#"
+            SELECT
+                gt.id, gt.term, gt.description, gt.domain, gt.owner_id,
+                COALESCE(gt.status, 'draft') as status,
+                COALESCE(gt.created_at, datetime('now')) as created_at,
+                COALESCE(gt.updated_at, datetime('now')) as updated_at,
+                COUNT(tl.id) as link_count
+            FROM glossary_terms gt
+            LEFT JOIN term_links tl ON gt.id = tl.term_id
+            WHERE gt.id = ?1
+            GROUP BY gt.id
+            "#,
+            [id],
+            |row| {
+                Ok(GlossaryTermResponse {
+                    id: row.get(0)?,
+                    term: row.get(1)?,
+                    description: row.get(2)?,
+                    domain: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    link_count: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => not_found(
+                format!("Glossary term {} not found", id),
+                request_id.0.clone(),
+            ),
+            _ => internal_error(e.to_string(), request_id.0.clone()),
+        })?;
+
+    Ok(Json(term))
+}
+
+/// Update a glossary term
+async fn update_glossary_term(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Path(id): Path<i64>,
+    Json(req): Json<UpdateGlossaryTermRequest>,
+) -> Result<Json<GlossaryTermResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(id, "Updating glossary term");
+
+    // Validate term if provided
+    if let Some(ref term) = req.term {
+        if term.trim().is_empty() {
+            return Err(bad_request(
+                "Term cannot be empty".to_string(),
+                request_id.0.clone(),
+            ));
+        }
+    }
+
+    // Validate status if provided
+    if let Some(ref status) = req.status {
+        let valid_statuses = ["draft", "approved", "deprecated"];
+        if !valid_statuses.contains(&status.as_str()) {
+            return Err(bad_request(
+                format!(
+                    "Invalid status '{}'. Must be one of: draft, approved, deprecated",
+                    status
+                ),
+                request_id.0.clone(),
+            ));
+        }
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Check term exists
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM glossary_terms WHERE id = ?1", [id], |_| {
+            Ok(true)
+        })
+        .unwrap_or(false);
+
+    if !exists {
+        return Err(not_found(
+            format!("Glossary term {} not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Build dynamic update
+    let mut updates = vec!["updated_at = datetime('now')"];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+
+    if let Some(ref term) = req.term {
+        updates.push("term = ?");
+        params.push(Box::new(term.clone()));
+    }
+    if let Some(ref description) = req.description {
+        updates.push("description = ?");
+        params.push(Box::new(description.clone()));
+    }
+    if let Some(ref domain) = req.domain {
+        updates.push("domain = ?");
+        params.push(Box::new(domain.clone()));
+    }
+    if let Some(ref owner_id) = req.owner_id {
+        updates.push("owner_id = ?");
+        params.push(Box::new(owner_id.clone()));
+    }
+    if let Some(ref status) = req.status {
+        updates.push("status = ?");
+        params.push(Box::new(status.clone()));
+    }
+
+    params.push(Box::new(id));
+
+    let sql = format!(
+        "UPDATE glossary_terms SET {} WHERE id = ?",
+        updates.join(", ")
+    );
+
+    conn.execute(
+        &sql,
+        rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+    )
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint failed") {
+            bad_request(
+                "A glossary term with that name already exists".to_string(),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
+
+    // Fetch updated term
+    let term = conn
+        .query_row(
+            r#"
+            SELECT
+                gt.id, gt.term, gt.description, gt.domain, gt.owner_id,
+                COALESCE(gt.status, 'draft') as status,
+                COALESCE(gt.created_at, datetime('now')) as created_at,
+                COALESCE(gt.updated_at, datetime('now')) as updated_at,
+                COUNT(tl.id) as link_count
+            FROM glossary_terms gt
+            LEFT JOIN term_links tl ON gt.id = tl.term_id
+            WHERE gt.id = ?1
+            GROUP BY gt.id
+            "#,
+            [id],
+            |row| {
+                Ok(GlossaryTermResponse {
+                    id: row.get(0)?,
+                    term: row.get(1)?,
+                    description: row.get(2)?,
+                    domain: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    link_count: row.get(8)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(id, term = %term.term, "Glossary term updated");
+
+    // Emit audit event
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "glossary_term",
+            term.term.clone(),
+            serde_json::json!({ "id": id }),
+            serde_json::json!({
+                "term": req.term,
+                "description": req.description,
+                "domain": req.domain,
+                "owner_id": req.owner_id,
+                "status": req.status,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok(Json(term))
+}
+
+/// Delete a glossary term
+async fn delete_glossary_term(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(id, "Deleting glossary term");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get term name for audit
+    let term_name: Option<String> = conn
+        .query_row(
+            "SELECT term FROM glossary_terms WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let rows = conn
+        .execute("DELETE FROM glossary_terms WHERE id = ?1", [id])
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    if rows == 0 {
+        return Err(not_found(
+            format!("Glossary term {} not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    tracing::info!(id, "Glossary term deleted");
+
+    // Emit audit event
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "glossary_term",
+            term_name.unwrap_or_else(|| id.to_string()),
+            serde_json::json!({ "id": id }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Get links for a glossary term
+async fn get_term_links(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<TermLinkResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(term_id = id, "Getting term links");
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Verify term exists
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM glossary_terms WHERE id = ?1", [id], |_| {
+            Ok(true)
+        })
+        .unwrap_or(false);
+
+    if !exists {
+        return Err(not_found(
+            format!("Glossary term {} not found", id),
+            request_id.0.clone(),
+        ));
+    }
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                tl.id, tl.term_id, tl.dataset_id, tl.field_id,
+                d.name as dataset_name, f.name as field_name
+            FROM term_links tl
+            LEFT JOIN datasets d ON tl.dataset_id = d.id
+            LEFT JOIN fields f ON tl.field_id = f.id
+            WHERE tl.term_id = ?1
+            ORDER BY tl.id
+            "#,
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let links: Vec<TermLinkResponse> = stmt
+        .query_map([id], |row| {
+            Ok(TermLinkResponse {
+                id: row.get(0)?,
+                term_id: row.get(1)?,
+                dataset_id: row.get(2)?,
+                field_id: row.get(3)?,
+                dataset_name: row.get(4)?,
+                field_name: row.get(5)?,
+            })
+        })
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(links))
+}
+
+/// Link a term to a dataset or field
+async fn link_term(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Path(id): Path<i64>,
+    Json(req): Json<LinkTermRequest>,
+) -> Result<(StatusCode, Json<TermLinkResponse>), (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(term_id = id, ?req.dataset_id, ?req.field_id, "Linking term");
+
+    // Validate - must provide exactly one of dataset_id or field_id
+    match (&req.dataset_id, &req.field_id) {
+        (None, None) => {
+            return Err(bad_request(
+                "Must provide either dataset_id or field_id".to_string(),
+                request_id.0.clone(),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(bad_request(
+                "Must provide only one of dataset_id or field_id, not both".to_string(),
+                request_id.0.clone(),
+            ));
+        }
+        _ => {}
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Verify term exists
+    let term_name: String = conn
+        .query_row(
+            "SELECT term FROM glossary_terms WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Glossary term {} not found", id),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Verify dataset/field exists
+    if let Some(dataset_id) = req.dataset_id {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM datasets WHERE id = ?1", [dataset_id], |_| {
+                Ok(true)
+            })
+            .unwrap_or(false);
+        if !exists {
+            return Err(not_found(
+                format!("Dataset {} not found", dataset_id),
+                request_id.0.clone(),
+            ));
+        }
+    }
+
+    if let Some(field_id) = req.field_id {
+        let exists: bool = conn
+            .query_row("SELECT 1 FROM fields WHERE id = ?1", [field_id], |_| {
+                Ok(true)
+            })
+            .unwrap_or(false);
+        if !exists {
+            return Err(not_found(
+                format!("Field {} not found", field_id),
+                request_id.0.clone(),
+            ));
+        }
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO term_links (term_id, dataset_id, field_id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, req.dataset_id, req.field_id],
+    )
+    .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let link_id = conn.last_insert_rowid();
+
+    // Get the link with names
+    let link = conn
+        .query_row(
+            r#"
+            SELECT
+                tl.id, tl.term_id, tl.dataset_id, tl.field_id,
+                d.name as dataset_name, f.name as field_name
+            FROM term_links tl
+            LEFT JOIN datasets d ON tl.dataset_id = d.id
+            LEFT JOIN fields f ON tl.field_id = f.id
+            WHERE tl.id = ?1
+            "#,
+            [link_id],
+            |row| {
+                Ok(TermLinkResponse {
+                    id: row.get(0)?,
+                    term_id: row.get(1)?,
+                    dataset_id: row.get(2)?,
+                    field_id: row.get(3)?,
+                    dataset_name: row.get(4)?,
+                    field_name: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    tracing::info!(term_id = id, link_id, "Term linked");
+
+    // Emit audit event
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "term_link",
+            term_name,
+            serde_json::json!({
+                "term_id": id,
+                "link_id": link_id,
+                "dataset_id": req.dataset_id,
+                "field_id": req.field_id,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
+    Ok((StatusCode::CREATED, Json(link)))
+}
+
+/// Unlink a term from datasets/fields
+async fn unlink_term(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
+    Path(id): Path<i64>,
+    Json(req): Json<LinkTermRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(term_id = id, ?req.dataset_id, ?req.field_id, "Unlinking term");
+
+    // Validate - must provide exactly one of dataset_id or field_id
+    match (&req.dataset_id, &req.field_id) {
+        (None, None) => {
+            return Err(bad_request(
+                "Must provide either dataset_id or field_id".to_string(),
+                request_id.0.clone(),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(bad_request(
+                "Must provide only one of dataset_id or field_id, not both".to_string(),
+                request_id.0.clone(),
+            ));
+        }
+        _ => {}
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Verify term exists and get name for audit
+    let term_name: String = conn
+        .query_row(
+            "SELECT term FROM glossary_terms WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Glossary term {} not found", id),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let rows = if let Some(dataset_id) = req.dataset_id {
+        conn.execute(
+            "DELETE FROM term_links WHERE term_id = ?1 AND dataset_id = ?2",
+            rusqlite::params![id, dataset_id],
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+    } else if let Some(field_id) = req.field_id {
+        conn.execute(
+            "DELETE FROM term_links WHERE term_id = ?1 AND field_id = ?2",
+            rusqlite::params![id, field_id],
+        )
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+    } else {
+        0
+    };
+
+    if rows == 0 {
+        return Err(not_found(
+            "Link not found".to_string(),
+            request_id.0.clone(),
+        ));
+    }
+
+    tracing::info!(term_id = id, "Term unlinked");
+
+    // Emit audit event
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "term_link",
+            term_name,
+            serde_json::json!({
+                "term_id": id,
+                "dataset_id": req.dataset_id,
+                "field_id": req.field_id,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2671,6 +4238,7 @@ async fn delete_owner(
 async fn create_lineage_edge(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Json(req): Json<CreateLineageEdgeRequest>,
 ) -> Result<(StatusCode, Json<LineageEdgeResponse>), (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(
@@ -2747,6 +4315,22 @@ async fn create_lineage_edge(
         "Lineage edge created successfully"
     );
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "lineage_edge",
+            format!("{}:{}", req.source_dataset, req.target_dataset),
+            serde_json::json!({
+                "id": edge.id,
+                "source_dataset": req.source_dataset,
+                "target_dataset": req.target_dataset,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
     Ok((StatusCode::CREATED, Json(edge)))
 }
 
@@ -2758,6 +4342,7 @@ async fn create_lineage_edge(
 async fn create_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Json(req): Json<CreateGovernanceRuleRequest>,
 ) -> Result<(StatusCode, Json<GovernanceRuleResponse>), (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(name = %req.name, "Creating governance rule");
@@ -2813,6 +4398,23 @@ async fn create_governance_rule(
     };
 
     tracing::info!(name = %rule.name, "Governance rule created successfully");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::create(
+            "governance_rule",
+            &rule.name,
+            serde_json::json!({
+                "id": rule.id,
+                "name": rule.name,
+                "rule_type": rule.rule_type,
+                "priority": rule.priority,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
 
     Ok((StatusCode::CREATED, Json(rule)))
 }
@@ -2921,6 +4523,7 @@ async fn get_governance_rule(
 async fn update_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateGovernanceRuleRequest>,
 ) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -3012,6 +4615,24 @@ async fn update_governance_rule(
 
     tracing::info!(id = %id, "Governance rule updated successfully");
 
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "governance_rule",
+            id.to_string(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "id": rule.id,
+                "name": rule.name,
+                "rule_type": rule.rule_type,
+                "is_active": rule.is_active,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
+
     Ok(Json(rule))
 }
 
@@ -3019,6 +4640,7 @@ async fn update_governance_rule(
 async fn delete_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     tracing::debug!(id = %id, "Deleting governance rule");
@@ -3041,6 +4663,18 @@ async fn delete_governance_rule(
     }
 
     tracing::info!(id = %id, "Governance rule deleted successfully");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::delete(
+            "governance_rule",
+            id.to_string(),
+            serde_json::json!({ "id": id }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3209,6 +4843,7 @@ async fn list_quality_metrics(
 async fn set_freshness_config(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    Extension(audit_context): Extension<AuditContext>,
     Path(name): Path<String>,
     Json(req): Json<SetFreshnessConfigRequest>,
 ) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -3295,6 +4930,24 @@ async fn set_freshness_config(
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     tracing::info!(dataset = %name, "Freshness config set successfully");
+
+    // Emit audit event (non-blocking)
+    #[cfg(feature = "audit")]
+    {
+        let event = audit::AuditEvent::update(
+            "freshness_config",
+            &name,
+            serde_json::json!({}),
+            serde_json::json!({
+                "dataset": name,
+                "expected_interval_secs": config.expected_interval_secs,
+                "grace_period_secs": config.grace_period_secs,
+                "alert_on_stale": config.alert_on_stale,
+            }),
+            &request_id.0,
+        );
+        state.audit_logger.log(audit_context.enrich_event(event));
+    }
 
     Ok(Json(config))
 }
@@ -3437,6 +5090,127 @@ async fn get_dataset_schema(
     Ok(Json(response))
 }
 
+/// Get schema diff between two Delta versions
+async fn get_dataset_schema_diff(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(name): Path<String>,
+    Query(params): Query<SchemaDiffQueryParams>,
+) -> Result<Json<SchemaDiffResponse>, (StatusCode, Json<ErrorResponse>)> {
+    tracing::debug!(
+        dataset = %name,
+        from = params.from,
+        to = params.to,
+        "Getting schema diff from Delta"
+    );
+
+    validation::validate_dataset_name(&name)
+        .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
+
+    // Validate version range
+    if params.from >= params.to {
+        return Err(bad_request(
+            "Parameter 'from' must be less than 'to'".to_string(),
+            request_id.0.clone(),
+        ));
+    }
+
+    // Limit version range to prevent expensive operations
+    let max_version_range: i64 = std::env::var("METAFUSE_SCHEMA_DIFF_MAX_VERSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+
+    if params.to - params.from > max_version_range {
+        return Err(bad_request(
+            format!(
+                "Version range exceeds maximum of {} versions",
+                max_version_range
+            ),
+            request_id.0.clone(),
+        ));
+    }
+
+    let conn = state
+        .backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Get delta_location from dataset
+    let delta_location: Option<String> = conn
+        .query_row(
+            "SELECT delta_location FROM datasets WHERE name = ?1",
+            [&name],
+            |row| row.get(0),
+        )
+        .map_err(|_| {
+            not_found(
+                format!("Dataset '{}' not found", name),
+                request_id.0.clone(),
+            )
+        })?;
+
+    let delta_location = delta_location.ok_or_else(|| {
+        bad_request(
+            format!("Dataset '{}' does not have a delta_location", name),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get schema diff from Delta
+    let diff = state
+        .delta_reader
+        .diff_schemas(&delta_location, params.from, params.to)
+        .await
+        .map_err(|e| {
+            internal_error(
+                format!("Failed to compute schema diff: {}", e),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Convert to response types
+    let response = SchemaDiffResponse {
+        dataset_name: name,
+        from_version: diff.from_version,
+        to_version: diff.to_version,
+        added_columns: diff
+            .added_columns
+            .into_iter()
+            .map(|f| SchemaDiffField {
+                name: f.name,
+                data_type: f.data_type,
+                nullable: f.nullable,
+                description: f.description,
+            })
+            .collect(),
+        removed_columns: diff
+            .removed_columns
+            .into_iter()
+            .map(|f| SchemaDiffField {
+                name: f.name,
+                data_type: f.data_type,
+                nullable: f.nullable,
+                description: f.description,
+            })
+            .collect(),
+        modified_columns: diff
+            .modified_columns
+            .into_iter()
+            .map(|c| SchemaDiffFieldChange {
+                name: c.name,
+                old_type: c.old_type,
+                new_type: c.new_type,
+                old_nullable: c.old_nullable,
+                new_nullable: c.new_nullable,
+            })
+            .collect(),
+    };
+
+    Ok(Json(response))
+}
+
 /// Get stats from Delta table
 async fn get_dataset_stats(
     State(state): State<AppState>,
@@ -3568,4 +5342,141 @@ async fn get_dataset_history(
     };
 
     Ok(Json(response))
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[test]
+    fn test_audit_context_new() {
+        let ctx = AuditContext::new(
+            Some("api-key-123".to_string()),
+            Some("192.168.1.1".to_string()),
+        );
+        assert_eq!(ctx.api_key_id, Some("api-key-123".to_string()));
+        assert_eq!(ctx.client_ip, Some("192.168.1.1".to_string()));
+    }
+
+    #[test]
+    fn test_audit_context_default() {
+        let ctx = AuditContext::default();
+        assert_eq!(ctx.api_key_id, None);
+        assert_eq!(ctx.client_ip, None);
+    }
+
+    #[cfg(feature = "audit")]
+    mod audit_enrichment_tests {
+        use super::*;
+
+        #[test]
+        fn test_enrich_event_with_api_key() {
+            let ctx = AuditContext::new(Some("api-key-123".to_string()), None);
+            let event = audit::AuditEvent::create(
+                "dataset",
+                "test_dataset",
+                serde_json::json!({}),
+                "req-123",
+            );
+            let enriched = ctx.enrich_event(event);
+            assert_eq!(enriched.actor, Some("api-key-123".to_string()));
+            assert_eq!(enriched.actor_type, audit::ActorType::Service);
+        }
+
+        #[test]
+        fn test_enrich_event_anonymous() {
+            let ctx = AuditContext::new(None, None);
+            let event = audit::AuditEvent::create(
+                "dataset",
+                "test_dataset",
+                serde_json::json!({}),
+                "req-123",
+            );
+            let enriched = ctx.enrich_event(event);
+            assert_eq!(enriched.actor, Some("anonymous".to_string()));
+            assert_eq!(enriched.actor_type, audit::ActorType::Anonymous);
+        }
+
+        #[test]
+        fn test_enrich_event_with_client_ip() {
+            let ctx = AuditContext::new(
+                Some("api-key-123".to_string()),
+                Some("10.0.0.1".to_string()),
+            );
+            let event = audit::AuditEvent::create(
+                "dataset",
+                "test_dataset",
+                serde_json::json!({}),
+                "req-123",
+            );
+            let enriched = ctx.enrich_event(event);
+            assert_eq!(enriched.client_ip, Some("10.0.0.1".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_extract_client_ip_x_forwarded_for() {
+        let req = Request::builder()
+            .header(
+                "x-forwarded-for",
+                "203.0.113.195, 70.41.3.18, 150.172.238.178",
+            )
+            .body(Body::empty())
+            .unwrap();
+        let ip = extract_client_ip(&req);
+        assert_eq!(ip, Some("203.0.113.195".to_string()));
+    }
+
+    #[test]
+    fn test_extract_client_ip_x_forwarded_for_single() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "192.168.1.100")
+            .body(Body::empty())
+            .unwrap();
+        let ip = extract_client_ip(&req);
+        assert_eq!(ip, Some("192.168.1.100".to_string()));
+    }
+
+    #[test]
+    fn test_extract_client_ip_x_real_ip() {
+        let req = Request::builder()
+            .header("x-real-ip", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let ip = extract_client_ip(&req);
+        assert_eq!(ip, Some("10.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_client_ip_prefers_x_forwarded_for() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "203.0.113.195")
+            .header("x-real-ip", "10.0.0.1")
+            .body(Body::empty())
+            .unwrap();
+        let ip = extract_client_ip(&req);
+        assert_eq!(ip, Some("203.0.113.195".to_string()));
+    }
+
+    #[test]
+    fn test_extract_client_ip_none() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let ip = extract_client_ip(&req);
+        assert_eq!(ip, None);
+    }
+
+    #[test]
+    fn test_extract_client_ip_empty_header() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "")
+            .body(Body::empty())
+            .unwrap();
+        let ip = extract_client_ip(&req);
+        assert_eq!(ip, None);
+    }
 }

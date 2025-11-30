@@ -12,7 +12,8 @@ name = "metafuse-api"
 path = "src/main.rs"
 
 [features]
-default = []
+# Enterprise features enabled by default for v0.7.0
+default = ["audit", "usage-analytics", "classification"]
 metrics = ["prometheus", "lazy_static"]
 rate-limiting = ["dashmap"]
 api-keys = ["bcrypt", "rand", "dashmap", "hex"]
@@ -20,8 +21,10 @@ api-keys = ["bcrypt", "rand", "dashmap", "hex"]
 audit = []
 usage-analytics = ["dashmap"]
 classification = ["regex"]
-# Enterprise bundle
+# Enterprise bundle (all enterprise features)
 enterprise = ["audit", "usage-analytics", "classification"]
+# Production bundle (enterprise + security)
+production = ["enterprise", "rate-limiting", "api-keys", "metrics"]
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }

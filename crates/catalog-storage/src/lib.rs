@@ -2,8 +2,30 @@
 //!
 //! Storage backend abstraction for the MetaFuse catalog.
 //! Supports local SQLite with future extensions for GCS/S3.
+//!
+//! # Multi-Tenant Support
+//!
+//! The `tenant` module provides physical tenant isolation through per-tenant
+//! SQLite databases. See [`tenant::TenantContext`] for details.
+//!
+//! The `factory` module provides connection pooling and LRU caching for
+//! per-tenant backends. See [`factory::TenantBackendFactory`] for details.
 
 use metafuse_catalog_core::{init_sqlite_schema, CatalogError, Result};
+
+// Multi-tenant support
+pub mod tenant;
+pub use tenant::{TenantContext, TenantStatus, TenantTier};
+
+// Connection pool configuration
+pub mod pool_config;
+pub use pool_config::{CircuitBreakerConfig, ConnectionPoolConfig};
+
+// Tenant backend factory with connection pooling
+pub mod factory;
+pub use factory::{
+    TenantBackendFactory, TenantBackendFactoryStats, TenantBackendHandle, TenantPoolStats,
+};
 use rusqlite::Connection;
 use std::fmt;
 use std::fs;

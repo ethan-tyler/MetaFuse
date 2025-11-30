@@ -21,3 +21,13 @@ pub mod quality;
 
 #[cfg(feature = "classification")]
 pub mod classification;
+
+// Multi-Tenant Control Plane
+pub mod control_plane;
+
+// Tenant Resolution Middleware
+#[cfg(feature = "api-keys")]
+pub mod tenant_resolver;
+
+// Multi-Tenant Integration Layer
+pub mod multi_tenant;

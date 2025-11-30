@@ -3,6 +3,7 @@
 //! This module provides tiered rate limiting with support for:
 //! - Anonymous requests (IP-based, lower limits)
 //! - Authenticated requests (API key-based, higher limits)
+//! - Tenant-aware rate limiting (per-tenant quotas based on tier)
 //! - Trusted proxy support (X-Forwarded-For extraction)
 //! - Standard RFC 6585 compliant 429 responses
 //!
@@ -14,6 +15,16 @@
 //! - `METAFUSE_TRUSTED_PROXIES`: Comma-separated list of trusted proxy IPs (optional, supports IPv4/IPv6)
 //! - `METAFUSE_RATE_LIMIT_MAX_BUCKETS`: Maximum bucket storage (default: 10000)
 //! - `METAFUSE_RATE_LIMIT_BUCKET_TTL_SECS`: Idle bucket TTL in seconds (default: 600)
+//!
+//! ## Multi-Tenant Rate Limits
+//!
+//! When multi-tenant mode is enabled, rate limits are applied per-tenant with tier-based quotas:
+//! - Free tier: 100 requests/minute (configurable via `METAFUSE_RATE_LIMIT_FREE`)
+//! - Standard tier: 1000 requests/minute (configurable via `METAFUSE_RATE_LIMIT_STANDARD`)
+//! - Premium tier: 5000 requests/minute (configurable via `METAFUSE_RATE_LIMIT_PREMIUM`)
+//! - Enterprise tier: 10000 requests/minute (configurable via `METAFUSE_RATE_LIMIT_ENTERPRISE`)
+//!
+//! Rate limit keys in multi-tenant mode: `tenant:{tenant_id}:{api_key_or_ip}`
 //!
 //! ## Security
 //!
@@ -63,10 +74,49 @@ const DEFAULT_MAX_BUCKETS: usize = 10_000;
 /// Default TTL for idle rate limit buckets (10 minutes)
 const DEFAULT_BUCKET_TTL_SECS: u64 = 600;
 
+// Tenant tier-based rate limits (requests per window)
+const DEFAULT_FREE_TIER_LIMIT: u32 = 100;
+const DEFAULT_STANDARD_TIER_LIMIT: u32 = 1000;
+const DEFAULT_PREMIUM_TIER_LIMIT: u32 = 5000;
+const DEFAULT_ENTERPRISE_TIER_LIMIT: u32 = 10000;
+
 /// Marker type for API key identity in request extensions
 #[derive(Clone, Debug)]
 pub struct ApiKeyId {
     pub id: String,
+}
+
+/// Tenant rate limit info for request extensions.
+///
+/// This is injected by tenant resolution middleware to enable
+/// tenant-aware rate limiting with tier-based quotas.
+#[derive(Clone, Debug)]
+pub struct TenantRateLimitInfo {
+    /// Tenant identifier
+    pub tenant_id: String,
+    /// Tenant tier for determining rate limit
+    pub tier: TenantTier,
+}
+
+/// Tenant tier for rate limiting purposes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TenantTier {
+    Free,
+    Standard,
+    Premium,
+    Enterprise,
+}
+
+impl TenantTier {
+    /// Parse tier from string.
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "free" => TenantTier::Free,
+            "premium" => TenantTier::Premium,
+            "enterprise" => TenantTier::Enterprise,
+            _ => TenantTier::Standard, // Default to standard
+        }
+    }
 }
 
 /// Configuration for rate limiting
@@ -82,6 +132,11 @@ pub struct RateLimitConfig {
     /// Reserved for future bucket cleanup implementation
     #[allow(dead_code)]
     pub bucket_ttl_secs: u64,
+    // Tenant tier-based limits
+    pub free_tier_limit: u32,
+    pub standard_tier_limit: u32,
+    pub premium_tier_limit: u32,
+    pub enterprise_tier_limit: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -110,6 +165,23 @@ impl Default for RateLimitConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_BUCKET_TTL_SECS),
+            // Tenant tier limits
+            free_tier_limit: std::env::var("METAFUSE_RATE_LIMIT_FREE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_FREE_TIER_LIMIT),
+            standard_tier_limit: std::env::var("METAFUSE_RATE_LIMIT_STANDARD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_STANDARD_TIER_LIMIT),
+            premium_tier_limit: std::env::var("METAFUSE_RATE_LIMIT_PREMIUM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_PREMIUM_TIER_LIMIT),
+            enterprise_tier_limit: std::env::var("METAFUSE_RATE_LIMIT_ENTERPRISE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_ENTERPRISE_TIER_LIMIT),
         }
     }
 }
@@ -211,8 +283,59 @@ impl RateLimiter {
         })
     }
 
+    /// Get rate limit for a tenant tier.
+    fn get_tier_limit(&self, tier: TenantTier) -> u32 {
+        match tier {
+            TenantTier::Free => self.config.free_tier_limit,
+            TenantTier::Standard => self.config.standard_tier_limit,
+            TenantTier::Premium => self.config.premium_tier_limit,
+            TenantTier::Enterprise => self.config.enterprise_tier_limit,
+        }
+    }
+
     fn get_rate_limit_key<B>(&self, req: &Request<B>) -> (String, u32) {
-        // Priority 1: Check for authenticated API key
+        // Priority 0: Check for tenant context (multi-tenant mode)
+        // When a tenant is resolved, rate limits are scoped to the tenant
+        if let Some(tenant_info) = req.extensions().get::<TenantRateLimitInfo>() {
+            let limit = self.get_tier_limit(tenant_info.tier);
+
+            // Sub-priority 0a: Tenant + API key
+            if let Some(api_key) = req.extensions().get::<ApiKeyId>() {
+                let key = format!("tenant:{}:auth:{}", tenant_info.tenant_id, api_key.id);
+                debug!(
+                    rate_limit_key = %key,
+                    tenant_id = %tenant_info.tenant_id,
+                    tier = ?tenant_info.tier,
+                    limit = limit,
+                    "Using tenant + API key for rate limiting"
+                );
+                return (key, limit);
+            }
+
+            // Sub-priority 0b: Tenant + IP (header-only auth)
+            if let Some(ip) = self.extract_client_ip(req) {
+                let key = format!("tenant:{}:ip:{}", tenant_info.tenant_id, ip);
+                debug!(
+                    rate_limit_key = %key,
+                    tenant_id = %tenant_info.tenant_id,
+                    tier = ?tenant_info.tier,
+                    limit = limit,
+                    "Using tenant + IP for rate limiting"
+                );
+                return (key, limit);
+            }
+
+            // Fallback: tenant only (shouldn't happen in practice)
+            let key = format!("tenant:{}:unknown", tenant_info.tenant_id);
+            debug!(
+                rate_limit_key = %key,
+                tenant_id = %tenant_info.tenant_id,
+                "Using tenant-only key for rate limiting"
+            );
+            return (key, limit);
+        }
+
+        // Priority 1: Check for authenticated API key (non-tenant mode)
         if let Some(api_key) = req.extensions().get::<ApiKeyId>() {
             let key = format!("auth:{}", api_key.id);
             debug!(rate_limit_key = %key, "Using API key for rate limiting");
@@ -413,12 +536,107 @@ mod tests {
     use super::*;
     use axum::http::Request;
 
+    /// Helper to create a test config with custom limits
+    fn test_config(anonymous: u32, authenticated: u32) -> RateLimitConfig {
+        RateLimitConfig {
+            anonymous_limit: anonymous,
+            authenticated_limit: authenticated,
+            window_secs: 60,
+            trusted_proxies: None,
+            max_buckets: DEFAULT_MAX_BUCKETS,
+            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
+            free_tier_limit: DEFAULT_FREE_TIER_LIMIT,
+            standard_tier_limit: DEFAULT_STANDARD_TIER_LIMIT,
+            premium_tier_limit: DEFAULT_PREMIUM_TIER_LIMIT,
+            enterprise_tier_limit: DEFAULT_ENTERPRISE_TIER_LIMIT,
+        }
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = RateLimitConfig::default();
         assert_eq!(config.anonymous_limit, DEFAULT_ANONYMOUS_LIMIT);
         assert_eq!(config.authenticated_limit, DEFAULT_AUTHENTICATED_LIMIT);
         assert_eq!(config.window_secs, DEFAULT_WINDOW_SECS);
+        // Verify tier limits
+        assert_eq!(config.free_tier_limit, DEFAULT_FREE_TIER_LIMIT);
+        assert_eq!(config.standard_tier_limit, DEFAULT_STANDARD_TIER_LIMIT);
+        assert_eq!(config.premium_tier_limit, DEFAULT_PREMIUM_TIER_LIMIT);
+        assert_eq!(config.enterprise_tier_limit, DEFAULT_ENTERPRISE_TIER_LIMIT);
+    }
+
+    #[test]
+    fn test_tenant_tier_parsing() {
+        assert_eq!("free".parse::<TenantTier>().unwrap(), TenantTier::Free);
+        assert_eq!("FREE".parse::<TenantTier>().unwrap(), TenantTier::Free);
+        assert_eq!(
+            "standard".parse::<TenantTier>().unwrap(),
+            TenantTier::Standard
+        );
+        assert_eq!(
+            "premium".parse::<TenantTier>().unwrap(),
+            TenantTier::Premium
+        );
+        assert_eq!(
+            "enterprise".parse::<TenantTier>().unwrap(),
+            TenantTier::Enterprise
+        );
+        // Unknown tier returns error, caller decides fallback
+        assert!("unknown".parse::<TenantTier>().is_err());
+    }
+
+    #[test]
+    fn test_tenant_rate_limit_with_api_key() {
+        let limiter = RateLimiter::new(test_config(100, 1000));
+        let mut req = Request::builder().body(()).unwrap();
+
+        // Set tenant info (Premium tier: 5000 limit)
+        req.extensions_mut().insert(TenantRateLimitInfo {
+            tenant_id: "acme-corp".to_string(),
+            tier: TenantTier::Premium,
+        });
+        req.extensions_mut().insert(ApiKeyId {
+            id: "key-123".to_string(),
+        });
+
+        let (key, limit) = limiter.get_rate_limit_key(&req);
+        assert_eq!(key, "tenant:acme-corp:auth:key-123");
+        assert_eq!(limit, DEFAULT_PREMIUM_TIER_LIMIT);
+    }
+
+    #[test]
+    fn test_tenant_rate_limit_with_ip() {
+        let limiter = RateLimiter::new(test_config(100, 1000));
+        let addr: SocketAddr = "192.168.1.100:8080".parse().unwrap();
+        let mut req = Request::builder().body(()).unwrap();
+
+        // Set tenant info (Free tier: 100 limit)
+        req.extensions_mut().insert(TenantRateLimitInfo {
+            tenant_id: "test-tenant".to_string(),
+            tier: TenantTier::Free,
+        });
+        req.extensions_mut().insert(ConnectInfo(addr));
+
+        let (key, limit) = limiter.get_rate_limit_key(&req);
+        assert_eq!(key, "tenant:test-tenant:ip:192.168.1.100");
+        assert_eq!(limit, DEFAULT_FREE_TIER_LIMIT);
+    }
+
+    #[test]
+    fn test_enterprise_tier_limit() {
+        let limiter = RateLimiter::new(test_config(100, 1000));
+        let addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
+        let mut req = Request::builder().body(()).unwrap();
+
+        req.extensions_mut().insert(TenantRateLimitInfo {
+            tenant_id: "big-corp".to_string(),
+            tier: TenantTier::Enterprise,
+        });
+        req.extensions_mut().insert(ConnectInfo(addr));
+
+        let (key, limit) = limiter.get_rate_limit_key(&req);
+        assert_eq!(key, "tenant:big-corp:ip:10.0.0.1");
+        assert_eq!(limit, DEFAULT_ENTERPRISE_TIER_LIMIT);
     }
 
     #[test]
@@ -448,14 +666,9 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_allows_under_limit() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 5,
-            authenticated_limit: 10,
-            window_secs: 60,
-            trusted_proxies: None,
-            max_buckets: DEFAULT_MAX_BUCKETS,
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let mut config = test_config(5, 10);
+        config.window_secs = 60;
+        let limiter = RateLimiter::new(config);
 
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let mut req = Request::builder().body(()).unwrap();
@@ -474,14 +687,9 @@ mod tests {
 
     #[test]
     fn test_trusted_proxy_validation() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 100,
-            authenticated_limit: 1000,
-            window_secs: 60,
-            trusted_proxies: Some(vec!["10.0.0.1".to_string()]),
-            max_buckets: DEFAULT_MAX_BUCKETS,
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let mut config = test_config(100, 1000);
+        config.trusted_proxies = Some(vec!["10.0.0.1".to_string()]);
+        let limiter = RateLimiter::new(config);
 
         // Request from trusted proxy with X-Forwarded-For
         let trusted_addr: SocketAddr = "10.0.0.1:8080".parse().unwrap();
@@ -518,14 +726,7 @@ mod tests {
 
     #[test]
     fn test_bucket_cleanup() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 100,
-            authenticated_limit: 1000,
-            window_secs: 60,
-            trusted_proxies: None,
-            max_buckets: DEFAULT_MAX_BUCKETS,
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let limiter = RateLimiter::new(test_config(100, 1000));
 
         // Create several buckets
         for i in 0..10 {
@@ -544,14 +745,7 @@ mod tests {
 
     #[test]
     fn test_bucket_ttl_prevents_eviction_of_active() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 100,
-            authenticated_limit: 1000,
-            window_secs: 60,
-            trusted_proxies: None,
-            max_buckets: DEFAULT_MAX_BUCKETS,
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let limiter = RateLimiter::new(test_config(100, 1000));
 
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let mut req = Request::builder().body(()).unwrap();
@@ -568,14 +762,9 @@ mod tests {
 
     #[test]
     fn test_trusted_proxy_ipv6() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 100,
-            authenticated_limit: 1000,
-            window_secs: 60,
-            trusted_proxies: Some(vec!["2001:db8::1".to_string()]),
-            max_buckets: DEFAULT_MAX_BUCKETS,
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let mut config = test_config(100, 1000);
+        config.trusted_proxies = Some(vec!["2001:db8::1".to_string()]);
+        let limiter = RateLimiter::new(config);
 
         // Request from trusted IPv6 proxy with X-Forwarded-For
         let trusted_addr: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
@@ -596,14 +785,9 @@ mod tests {
 
     #[test]
     fn test_untrusted_proxy_ignores_x_real_ip() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 100,
-            authenticated_limit: 1000,
-            window_secs: 60,
-            trusted_proxies: Some(vec!["10.0.0.1".to_string()]),
-            max_buckets: DEFAULT_MAX_BUCKETS,
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let mut config = test_config(100, 1000);
+        config.trusted_proxies = Some(vec!["10.0.0.1".to_string()]);
+        let limiter = RateLimiter::new(config);
 
         // Request from untrusted source with X-Real-IP header
         let untrusted_addr: SocketAddr = "192.168.1.1:8080".parse().unwrap();
@@ -625,14 +809,9 @@ mod tests {
     #[test]
     fn test_bucket_cap_enforcement() {
         // Create limiter with small cap for testing
-        let limiter = RateLimiter::new(RateLimitConfig {
-            anonymous_limit: 100,
-            authenticated_limit: 1000,
-            window_secs: 60,
-            trusted_proxies: None,
-            max_buckets: 20, // Small cap for testing
-            bucket_ttl_secs: DEFAULT_BUCKET_TTL_SECS,
-        });
+        let mut config = test_config(100, 1000);
+        config.max_buckets = 20;
+        let limiter = RateLimiter::new(config);
 
         // Create buckets up to half the cap
         for i in 0..10 {
