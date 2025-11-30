@@ -3,7 +3,7 @@
 //! Command-line interface for exploring and managing the MetaFuse catalog.
 
 use clap::{Parser, Subcommand};
-use metafuse_catalog_core::validation;
+use metafuse_catalog_core::{migrations, validation};
 use metafuse_catalog_storage::backend_from_uri;
 
 #[cfg(feature = "api-keys")]
@@ -64,12 +64,30 @@ enum Commands {
     /// Show catalog statistics
     Stats,
 
+    /// Manage schema migrations
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommands,
+    },
+
     #[cfg(feature = "api-keys")]
     /// Manage API keys
     Keys {
         #[command(subcommand)]
         command: KeyCommands,
     },
+}
+
+#[derive(Subcommand)]
+enum MigrateCommands {
+    /// Show migration status (current version, pending migrations)
+    Status,
+
+    /// Run all pending migrations
+    Run,
+
+    /// Show migration history
+    History,
 }
 
 #[cfg(feature = "api-keys")]
@@ -105,6 +123,11 @@ async fn main() {
         Commands::Show { name, lineage } => show_dataset(&cli.catalog, &name, lineage).await,
         Commands::Search { query } => search_datasets(&cli.catalog, &query).await,
         Commands::Stats => show_stats(&cli.catalog).await,
+        Commands::Migrate { command } => match command {
+            MigrateCommands::Status => migrate_status(&cli.catalog).await,
+            MigrateCommands::Run => migrate_run(&cli.catalog).await,
+            MigrateCommands::History => migrate_history(&cli.catalog).await,
+        },
         #[cfg(feature = "api-keys")]
         Commands::Keys { command } => match command {
             KeyCommands::Create { name } => create_api_key(&cli.catalog, name).await,
@@ -486,6 +509,103 @@ async fn show_stats(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn migrate_status(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = backend_from_uri(path)?;
+
+    if !backend.exists().await? {
+        return Err("Catalog does not exist. Run 'metafuse init' first.".into());
+    }
+
+    let conn = backend.get_connection().await?;
+
+    let current_version = migrations::get_schema_version(&conn)?;
+    let all = migrations::all_migrations();
+    let latest_version = all.last().map(|m| m.version).unwrap_or(0);
+    let needs_migration = migrations::needs_migration(&conn)?;
+
+    println!("Migration Status:");
+    println!("  Current version: {}", format_version(current_version));
+    println!("  Latest version:  {}", format_version(latest_version));
+
+    if needs_migration {
+        let pending: Vec<_> = all.iter().filter(|m| m.version > current_version).collect();
+        println!();
+        println!("Pending migrations ({}):", pending.len());
+        for m in pending {
+            println!("  {} - {}", format_version(m.version), m.description);
+        }
+        println!();
+        println!("Run 'metafuse migrate run' to apply pending migrations.");
+    } else {
+        println!();
+        println!("Schema is up to date.");
+    }
+
+    Ok(())
+}
+
+async fn migrate_run(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = backend_from_uri(path)?;
+
+    if !backend.exists().await? {
+        return Err("Catalog does not exist. Run 'metafuse init' first.".into());
+    }
+
+    let conn = backend.get_connection().await?;
+
+    println!("Running migrations...");
+    let applied = migrations::run_migrations(&conn)?;
+
+    if applied > 0 {
+        println!("Applied {} migration(s).", applied);
+
+        let new_version = migrations::get_schema_version(&conn)?;
+        println!("Schema is now at version {}.", format_version(new_version));
+    } else {
+        println!("No migrations to apply. Schema is already up to date.");
+    }
+
+    Ok(())
+}
+
+async fn migrate_history(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = backend_from_uri(path)?;
+
+    if !backend.exists().await? {
+        return Err("Catalog does not exist. Run 'metafuse init' first.".into());
+    }
+
+    let conn = backend.get_connection().await?;
+
+    let history = migrations::get_migration_history(&conn)?;
+
+    if history.is_empty() {
+        println!("No migrations have been applied.");
+        return Ok(());
+    }
+
+    println!("Migration History:");
+    println!();
+    for (version, description, applied_at) in history {
+        println!("  {} - {}", format_version(version), description);
+        println!("    Applied: {}", applied_at);
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Format a migration version number (e.g., 1000000 -> v1.0.0)
+fn format_version(version: i64) -> String {
+    if version == 0 {
+        return "v0.0.0 (no migrations)".to_string();
+    }
+    let major = version / 1_000_000;
+    let minor = (version / 1_000) % 1_000;
+    let patch = version % 1_000;
+    format!("v{}.{}.{}", major, minor, patch)
 }
 
 fn format_number(n: i64) -> String {

@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod migrations;
 pub mod validation;
 
 /// Metadata for a dataset in the catalog
@@ -347,6 +348,34 @@ pub fn init_sqlite_schema(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Initialize the catalog: base schema + migrations.
+///
+/// This is the recommended entry point for catalog initialization. It:
+/// 1. Creates the base schema (tables, indexes, triggers)
+/// 2. Runs any pending migrations to bring the schema up to date
+///
+/// The function is idempotent - safe to call multiple times.
+///
+/// # Arguments
+///
+/// * `conn` - SQLite connection (should be exclusive for initialization)
+/// * `run_migrations` - If true, automatically apply pending migrations
+///
+/// # Returns
+///
+/// The number of migrations applied (0 if already up to date).
+pub fn init_catalog(conn: &rusqlite::Connection, run_migrations_flag: bool) -> Result<usize> {
+    // Initialize base schema
+    init_sqlite_schema(conn)?;
+
+    // Optionally run migrations
+    if run_migrations_flag {
+        migrations::run_migrations(conn)
+    } else {
+        Ok(0)
+    }
+}
+
 /// Get the current catalog version for optimistic concurrency control
 pub fn get_catalog_version(conn: &rusqlite::Connection) -> Result<i64> {
     let version: i64 =
@@ -381,6 +410,56 @@ pub fn set_catalog_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_init_catalog() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        // init_catalog with migrations should work
+        let count = init_catalog(&conn, true).unwrap();
+        assert!(count > 0); // At least v1.0.0 migration
+
+        // Verify delta_location column was added
+        let has_col: bool = conn
+            .prepare("PRAGMA table_info(datasets)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|r| r.map(|n| n == "delta_location").unwrap_or(false));
+        assert!(has_col);
+
+        // Second call should be idempotent
+        let count2 = init_catalog(&conn, true).unwrap();
+        assert_eq!(count2, 0);
+    }
+
+    #[test]
+    fn test_init_catalog_without_migrations() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        // init_catalog without migrations should not apply them
+        let count = init_catalog(&conn, false).unwrap();
+        assert_eq!(count, 0);
+
+        // Base tables should exist
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(tables.contains(&"datasets".to_string()));
+
+        // But delta_location column should NOT exist (migration not run)
+        let has_col: bool = conn
+            .prepare("PRAGMA table_info(datasets)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|r| r.map(|n| n == "delta_location").unwrap_or(false));
+        assert!(!has_col);
+    }
 
     #[test]
     fn test_init_schema() {

@@ -170,6 +170,41 @@ metafuse search "analytics"
 metafuse stats
 ```
 
+### Schema Migrations
+
+MetaFuse uses a versioned migration system to evolve the database schema. Migrations are forward-only and idempotent.
+
+```bash
+# Check migration status
+metafuse migrate status
+
+# Run pending migrations
+metafuse migrate run
+
+# View migration history
+metafuse migrate history
+```
+
+**Programmatic Usage:**
+
+```rust
+use metafuse_catalog_core::init_catalog;
+use rusqlite::Connection;
+
+let conn = Connection::open("catalog.db")?;
+
+// Initialize schema and run all migrations
+let migrations_applied = init_catalog(&conn, true)?;
+println!("Applied {} migrations", migrations_applied);
+```
+
+**Migration Notes:**
+
+- Migrations are tracked in `schema_migrations` table
+- Advisory locking prevents concurrent migrations
+- Version format: `MAJOR*1_000_000 + MINOR*1_000 + PATCH` (e.g., v1.0.0 = 1_000_000)
+- Rollbacks are not supported - plan migrations carefully
+
 ### Run the REST API
 
 ```bash

@@ -104,9 +104,23 @@ Retrieve detailed information about a specific dataset, including schema and lin
 **Path Parameters:**
 - `name` (required): Dataset name
 
-**Example Request:**
+**Query Parameters:**
+
+- `include` (optional): Comma-separated list of additional data to include. Options: `delta`, `quality`, `lineage`
+
+**Example Requests:**
 ```bash
+# Basic request
 curl http://localhost:8080/api/v1/datasets/sales_data
+
+# With Delta Lake metadata
+curl "http://localhost:8080/api/v1/datasets/sales_data?include=delta"
+
+# With quality metrics
+curl "http://localhost:8080/api/v1/datasets/sales_data?include=quality"
+
+# With all optional data
+curl "http://localhost:8080/api/v1/datasets/sales_data?include=delta,quality,lineage"
 ```
 
 **Response:**
@@ -115,6 +129,7 @@ curl http://localhost:8080/api/v1/datasets/sales_data
   "name": "sales_data",
   "path": "s3://my-bucket/data/sales.parquet",
   "format": "parquet",
+  "delta_location": "s3://my-bucket/delta/sales",
   "tenant": "prod",
   "domain": "analytics",
   "owner": "data-team@example.com",
@@ -143,11 +158,11 @@ curl http://localhost:8080/api/v1/datasets/sales_data
       "nullable": false
     }
   ],
-  "upstream": [
+  "upstream_datasets": [
     "raw_transactions",
     "customer_master"
   ],
-  "downstream": [
+  "downstream_datasets": [
     "daily_sales_summary",
     "customer_revenue_report"
   ],
@@ -158,6 +173,45 @@ curl http://localhost:8080/api/v1/datasets/sales_data
   ],
   "created_at": "2025-11-15T10:00:00Z",
   "updated_at": "2025-11-20T08:30:00Z"
+}
+```
+
+**Optional Include Fields:**
+
+When `?include=delta` is specified:
+```json
+{
+  "delta": {
+    "version": 10,
+    "row_count": 1500000,
+    "size_bytes": 45000000,
+    "num_files": 24,
+    "partition_columns": ["date"],
+    "last_modified": "2025-11-20T08:30:00Z"
+  }
+}
+```
+
+When `?include=quality` is specified:
+```json
+{
+  "quality": {
+    "overall_score": 0.95,
+    "completeness_score": 0.98,
+    "freshness_score": 1.0,
+    "file_health_score": 0.87,
+    "last_computed": "2025-11-20T08:00:00Z"
+  }
+}
+```
+
+When `?include=lineage` is specified:
+```json
+{
+  "lineage": {
+    "upstream": ["raw_transactions", "customer_master"],
+    "downstream": ["daily_sales_summary", "customer_revenue_report"]
+  }
 }
 ```
 
@@ -226,16 +280,174 @@ curl "http://localhost:8080/api/v1/search?q=analytics+revenue"
 
 ---
 
+### Create Dataset
+
+**POST /api/v1/datasets**
+
+Create a new dataset in the catalog.
+
+**Request Body:**
+```json
+{
+  "name": "sales_data",
+  "path": "s3://my-bucket/data/sales.parquet",
+  "format": "parquet",
+  "delta_location": "s3://my-bucket/delta/sales",
+  "description": "Daily sales transactions",
+  "tenant": "prod",
+  "domain": "analytics",
+  "owner": "data-team@example.com",
+  "tags": ["sales", "production"],
+  "upstream_datasets": ["raw_transactions"]
+}
+```
+
+**Required Fields:**
+- `name`: Dataset name (alphanumeric, underscore, hyphen, dot)
+- `path`: Storage path
+- `format`: Data format (parquet, delta, csv, etc.)
+
+**Optional Fields:**
+- `delta_location`: Path to Delta table for live metadata queries
+- `description`, `tenant`, `domain`, `owner`: Metadata fields
+- `tags`: List of tags to attach
+- `upstream_datasets`: List of upstream dataset names for lineage
+
+**Status Codes:**
+- `201 Created`: Dataset created successfully
+- `400 Bad Request`: Invalid input or dataset already exists
+- `500 Internal Server Error`: Database error
+
+---
+
+### Update Dataset
+
+**PUT /api/v1/datasets/:name**
+
+Update an existing dataset's metadata.
+
+**Request Body:**
+```json
+{
+  "path": "s3://new-bucket/data/sales.parquet",
+  "description": "Updated description",
+  "owner": "new-team@example.com"
+}
+```
+
+All fields are optional. Only provided fields will be updated.
+
+**Status Codes:**
+- `200 OK`: Dataset updated successfully
+- `400 Bad Request`: Invalid input
+- `404 Not Found`: Dataset does not exist
+- `500 Internal Server Error`: Database error
+
+---
+
+### Delete Dataset
+
+**DELETE /api/v1/datasets/:name**
+
+Remove a dataset from the catalog.
+
+**Status Codes:**
+- `204 No Content`: Dataset deleted successfully
+- `404 Not Found`: Dataset does not exist
+- `500 Internal Server Error`: Database error
+
+---
+
+### Add Tags
+
+**POST /api/v1/datasets/:name/tags**
+
+Add tags to a dataset.
+
+**Request Body:**
+```json
+{
+  "tags": ["production", "validated"]
+}
+```
+
+**Response:** Returns the updated list of all tags on the dataset.
+
+**Status Codes:**
+- `200 OK`: Tags added successfully
+- `404 Not Found`: Dataset does not exist
+- `500 Internal Server Error`: Database error
+
+---
+
+### Remove Tags
+
+**POST /api/v1/datasets/:name/tags/remove**
+
+Remove tags from a dataset.
+
+> **Note:** This endpoint uses POST instead of DELETE because DELETE requests with request bodies
+> are not universally supported by all HTTP clients and proxies. The `/remove` suffix clearly
+> indicates the destructive nature of the operation.
+
+**Request Body:**
+```json
+{
+  "tags": ["deprecated", "test"]
+}
+```
+
+**Response:** Returns the remaining tags on the dataset after removal.
+
+**Status Codes:**
+- `200 OK`: Tags removed successfully
+- `404 Not Found`: Dataset does not exist
+- `500 Internal Server Error`: Database error
+
+---
+
+### Delta-Delegated Endpoints
+
+These endpoints query live metadata directly from Delta Lake tables. The dataset must have a `delta_location` configured.
+
+#### Get Schema
+
+**GET /api/v1/datasets/:name/schema**
+
+Get the schema directly from the Delta table.
+
+**Query Parameters:**
+- `version` (optional): Specific Delta version to query
+
+#### Get Stats
+
+**GET /api/v1/datasets/:name/stats**
+
+Get statistics (row count, size, file count) from the Delta table.
+
+#### Get History
+
+**GET /api/v1/datasets/:name/history**
+
+Get version history from the Delta table.
+
+**Query Parameters:**
+- `limit` (optional): Max versions to return (default: 10)
+
+---
+
 ## Error Responses
 
 All error responses follow this format:
 
 ```json
 {
-  "error": "Dataset not found",
-  "detail": "No dataset with name 'unknown_dataset' exists in the catalog"
+  "error": "Dataset 'unknown_dataset' not found",
+  "request_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
+
+The `request_id` is a UUID that can be used to correlate errors with server logs for debugging.
 
 **Common Status Codes:**
 - `400 Bad Request`: Invalid request parameters
@@ -305,18 +517,6 @@ curl "http://localhost:8080/api/v1/datasets/sales_data" | jq '{upstream, downstr
 ---
 
 ## Future Endpoints (Planned)
-
-### Create/Update Dataset
-
-**POST /api/v1/datasets**
-
-Manually create or update dataset metadata.
-
-### Delete Dataset
-
-**DELETE /api/v1/datasets/:name**
-
-Remove a dataset from the catalog.
 
 ### Glossary Management
 
