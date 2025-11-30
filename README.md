@@ -75,10 +75,23 @@ MetaFuse supports multiple storage backends:
 
 #### Environment Variables
 
+**Storage:**
+
 - **`METAFUSE_CATALOG_URI`**: Override default catalog location
 - **`METAFUSE_CACHE_TTL_SECS`**: Cache TTL for cloud backends (default: 60, 0 to disable)
 - **`GOOGLE_APPLICATION_CREDENTIALS`**: Path to GCS service account JSON (GCS only)
 - **`AWS_ACCESS_KEY_ID`**, **`AWS_SECRET_ACCESS_KEY`**: AWS credentials (S3 only)
+
+**API Server:**
+
+- **`METAFUSE_PORT`**: API server port (default: 8080)
+- **`METAFUSE_RUN_MIGRATIONS`**: Set to `true` to auto-run migrations on startup
+
+**Enterprise Features (v0.6.0+):**
+
+- **`METAFUSE_AUDIT_BATCH_SIZE`**: Max events per audit DB write batch (default: 100)
+- **`METAFUSE_AUDIT_FLUSH_INTERVAL_MS`**: Audit flush interval in ms (default: 5000)
+- **`METAFUSE_USAGE_FLUSH_INTERVAL_MS`**: Usage counter flush interval in ms (default: 60000)
 
 #### Examples
 

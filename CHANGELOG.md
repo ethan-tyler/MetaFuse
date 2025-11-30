@@ -7,6 +7,184 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2025-11-29
+
+### Governance & Delta Enhancement Release
+
+This release activates the PII classification engine, adds schema diff capabilities, and introduces full CRUD for domain management and business glossary.
+
+#### Added
+
+- **PII Classification Activated**
+  - `classification` feature now enabled by default
+  - `GET /api/v1/datasets/:name/classifications` - Get column classifications
+  - `POST /api/v1/datasets/:name/classifications` - Trigger manual scan
+  - `GET /api/v1/classifications/pii` - List all PII columns across catalog
+  - `PUT /api/v1/fields/:id/classification` - Manual classification override
+  - Auto-classification on dataset creation (opt-in via `METAFUSE_CLASSIFICATION_AUTO_SCAN=true`)
+  - Classification engine supports: EMAIL, PHONE, SSN, IP_ADDRESS, NAME, ADDRESS, DATE_OF_BIRTH
+
+- **Schema Diff Endpoint**
+  - `GET /api/v1/datasets/:name/schema/diff?from=X&to=Y` - Compare schema across Delta versions
+  - Returns added, removed, and modified columns between versions
+  - Leverages existing `DeltaReader::diff_schemas()` implementation
+
+- **Domain Management**
+  - New `domains` table (v1.1.0 migration)
+  - `GET /api/v1/domains` - List all domains with pagination
+  - `POST /api/v1/domains` - Create domain with name validation (slug format: `[a-z0-9_-]`)
+  - `GET /api/v1/domains/:name` - Get domain with dataset count
+  - `PUT /api/v1/domains/:name` - Update domain properties
+  - `DELETE /api/v1/domains/:name` - Soft delete (sets `is_active=0`)
+  - `GET /api/v1/domains/:name/datasets` - List datasets in domain
+  - Domains support `owner_id` for team ownership
+
+- **Glossary CRUD**
+  - `GET /api/v1/glossary` - List all glossary terms with pagination
+  - `POST /api/v1/glossary` - Create term with validation
+  - `GET /api/v1/glossary/:id` - Get term with link count
+  - `PUT /api/v1/glossary/:id` - Update term properties
+  - `DELETE /api/v1/glossary/:id` - Delete term (cascades to links)
+  - `GET /api/v1/glossary/:id/links` - Get term's dataset/field links
+  - `POST /api/v1/glossary/:id/links` - Link term to dataset or field
+  - `DELETE /api/v1/glossary/:id/links` - Unlink term
+  - Terms support status workflow: `draft` → `approved` → `deprecated`
+
+- **Schema Migration v1.1.0**
+  - New `domains` table with check constraints
+  - Added `domain_id` column to `datasets` table
+  - Enhanced `glossary_terms` with: `owner_id`, `status`, `created_at`, `updated_at`
+  - Indexes for common query patterns
+
+#### Changed
+
+- Default features now include `classification` (was: `audit`, `usage-analytics`)
+- All domain and glossary mutations emit audit events
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `METAFUSE_CLASSIFICATION_AUTO_SCAN` | `false` | Enable auto-classification on dataset creation |
+| `METAFUSE_SCHEMA_DIFF_MAX_VERSIONS` | `100` | Maximum version range for schema diff |
+
+---
+
+## [0.6.1] - 2025-11-29
+
+### Actor Enrichment for Audit Logging
+
+This patch release completes the audit context infrastructure promised in v0.6.0.
+
+#### Added
+
+- **AuditContext Middleware**
+  - Extracts API key identity from authenticated requests
+  - Extracts client IP from `X-Forwarded-For` or `X-Real-IP` headers
+  - Automatically injects `AuditContext` into all request handlers
+
+- **Actor Enrichment**
+  - All mutation handlers now enrich audit events with actor identity
+  - API key-authenticated requests logged with `ActorType::Service`
+  - Anonymous requests logged with `ActorType::Anonymous`
+  - Client IP included in audit events for traceability
+
+- **Tests**
+  - Unit tests for `AuditContext` struct and `enrich_event()` method
+  - Tests for `extract_client_ip()` function covering:
+    - X-Forwarded-For with multiple IPs (takes first)
+    - X-Real-IP header fallback
+    - Empty/missing header handling
+
+#### Changed
+
+- `AuditContext` is now always available (not feature-gated), enabling cleaner handler signatures
+- Middleware runs unconditionally to ensure `AuditContext` is present for all handlers
+
+#### Handlers Updated
+
+All 13 mutation handlers now include actor enrichment:
+
+- `create_dataset`, `update_dataset`, `delete_dataset`
+- `add_tags`, `remove_tags`
+- `create_owner`, `update_owner`, `delete_owner`
+- `create_lineage_edge`
+- `create_governance_rule`, `update_governance_rule`, `delete_governance_rule`
+- `set_freshness_config`
+
+---
+
+## [0.6.0] - 2025-11-29
+
+### Core Value Activation Release
+
+**Enterprise features activated** - This release activates dormant enterprise features that were already implemented but not wired to API handlers. Aligns with Lakehouse Catalog v2.0 Architecture.
+
+#### Added
+
+- **Quality Framework Activation**
+  - `GET /api/v1/datasets/:name/quality` - Compute/retrieve quality scores
+  - `GET /api/v1/quality/unhealthy?threshold=0.7` - List datasets below quality threshold
+  - Quality scores computed from Delta statistics (completeness, freshness, file health)
+  - `QualityCalculator` now fully wired to API handlers
+
+- **Usage Analytics Activation**
+  - `GET /api/v1/datasets/:name/usage` - Dataset usage statistics
+  - `GET /api/v1/analytics/popular?period=7d` - Most popular datasets
+  - `GET /api/v1/analytics/stale` - Detect stale/unused datasets
+  - `UsageTracker` with background flush task
+  - Automatic tracking on `get_dataset` and `search_datasets` handlers
+
+- **Audit Logging Expansion**
+  - Comprehensive audit coverage for all mutation handlers:
+    - Datasets: create, update, delete
+    - Tags: add, remove
+    - Owners: create, update, delete
+    - Lineage edges: create
+    - Governance rules: create, update, delete
+    - Freshness config: set
+  - `GET /api/v1/audit` endpoint with filters
+
+- **Feature Flag Updates**
+  - `audit` and `usage-analytics` enabled by default
+  - New `production` bundle: `enterprise + rate-limiting + api-keys + metrics`
+  - Zero-config activation for enterprise features
+
+#### Changed
+
+- Default features now include `audit` and `usage-analytics` for out-of-box enterprise functionality
+- All 70+ tests pass with new default features
+- **Breaking for users who relied on minimal default features**: If you need a minimal build without
+  enterprise features, use `--no-default-features` and enable only what you need
+
+#### Configuration
+
+Environment variables for tuning enterprise features:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `METAFUSE_AUDIT_BATCH_SIZE` | 100 | Max events per DB write batch |
+| `METAFUSE_AUDIT_FLUSH_INTERVAL_MS` | 5000 | Flush interval for audit queue |
+| `METAFUSE_USAGE_FLUSH_INTERVAL_MS` | 60000 | Flush interval for usage counters |
+
+#### Known Limitations
+
+- ~~Audit events include `request_id` for traceability but not yet full actor identity (API key/user).
+  `AuditContext` infrastructure is added; actor enrichment will be completed in v0.6.1.~~
+  **Resolved in v0.6.1** - Actor enrichment now complete with API key identity and client IP.
+
+#### Architecture
+
+v0.6.0 aligns with the Lakehouse Catalog v2.0 Architecture specification:
+
+- **Delta Delegation Pattern**: "Store what Delta doesn't know, delegate what Delta maintains"
+- **Enterprise Feature Activation**: Quality, Usage Analytics, Audit Logging all wired
+- **Multi-tenant Foundation**: Prepared for v0.8.0 physical tenant isolation
+
+---
+
 ### v0.5.0 - CI Enhancement & Cloud Testing
 
 **No breaking changes** - this release focuses on CI infrastructure and testing improvements.

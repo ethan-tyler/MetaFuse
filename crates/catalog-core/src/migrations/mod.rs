@@ -39,6 +39,8 @@ use crate::{CatalogError, Result};
 use rusqlite::Connection;
 
 mod v1_0_0;
+mod v1_1_0;
+mod v1_2_0;
 
 /// Migration version number.
 pub type MigrationVersion = i64;
@@ -59,7 +61,11 @@ pub struct Migration {
 /// All available migrations in order.
 /// Add new migrations to the end of this array.
 pub fn all_migrations() -> Vec<Migration> {
-    vec![v1_0_0::migration()]
+    vec![
+        v1_0_0::migration(),
+        v1_1_0::migration(),
+        v1_2_0::migration(),
+    ]
 }
 
 /// Initialize the migrations tracking table with advisory lock support.

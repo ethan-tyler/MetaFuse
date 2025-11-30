@@ -2,11 +2,11 @@
 
 This document outlines the planned development phases for MetaFuse.
 
-## Current Status: Phase 2.5 (v0.4.2) Complete ✓
+## Current Status: v0.7.0 Complete ✓
 
-MetaFuse v0.4.2 is production-ready with enterprise-grade security features including rate limiting and API key authentication.
+MetaFuse v0.7.0 delivers governance capabilities with PII classification, domain management, glossary CRUD, and Delta Lake schema diff.
 
-**Latest Release**: v0.4.2 - Security & Authentication Release (January 2025)
+**Latest Release**: v0.7.0 - Governance & Delta Enhancement Release (November 2025)
 
 ---
 
@@ -291,6 +291,66 @@ Cache revalidation with `METAFUSE_CACHE_REVALIDATE=true` **already exists** in v
 
 ---
 
+## Phase 2.2: Core Value Activation (v0.6.0 - Q1 2025)
+
+**Goal:** Activate dormant enterprise features and align with v2.0 architecture.
+
+This phase activates enterprise features that were already implemented but dormant in the codebase. The v1.0.0 migration created tables for quality_metrics, freshness_config, governance_rules, etc., and the modules existed but weren't wired to handlers.
+
+### Completed
+
+- [done] **Quality Framework Activation**
+  - `QualityCalculator` wired to API handlers
+  - `GET /api/v1/datasets/:name/quality` - Compute/retrieve quality scores
+  - `GET /api/v1/quality/unhealthy?threshold=0.7` - List datasets below threshold
+  - Quality scores computed from Delta statistics (completeness, freshness, file health)
+
+- [done] **Usage Analytics Activation**
+  - `UsageTracker` wired to dataset read handlers
+  - Background flush task for periodic database writes
+  - `GET /api/v1/datasets/:name/usage` - Dataset usage stats
+  - `GET /api/v1/analytics/popular?period=7d` - Popular datasets
+  - `GET /api/v1/analytics/stale` - Detect stale datasets
+  - Automatic tracking on `get_dataset` and `search_datasets`
+
+- [done] **Audit Logging Activation**
+  - `AuditLogger` wired to all mutation handlers
+  - Background batched writes with graceful degradation
+  - `GET /api/v1/audit` - Query audit log with filters
+  - Comprehensive coverage: datasets, tags, owners, lineage, governance rules, freshness config
+
+- [done] **Freshness Configuration Endpoints**
+  - `POST /api/v1/datasets/:name/freshness` - Configure freshness SLA
+  - `GET /api/v1/datasets/:name/freshness` - Get freshness config
+  - SLA-based freshness scoring in quality framework
+
+- [done] **Feature Flags Updated**
+  - `audit` and `usage-analytics` enabled by default
+  - New `production` bundle: `enterprise + rate-limiting + api-keys + metrics`
+  - Zero-config activation for enterprise features
+
+### Architecture Alignment
+
+v0.6.0 aligns with the [Lakehouse Catalog v2.0 Architecture](lakehouse-catalog-v2-spec.md):
+
+- **Delta Delegation Pattern**: "Store what Delta doesn't know, delegate what Delta maintains"
+- **Enterprise Feature Activation**: Quality, Usage Analytics, Audit Logging all wired
+- **Multi-tenant Foundation**: Prepared for v0.8.0 physical tenant isolation
+
+### New API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/datasets/:name/quality` | GET | Get/compute quality scores |
+| `/api/v1/quality/unhealthy` | GET | List unhealthy datasets |
+| `/api/v1/datasets/:name/usage` | GET | Dataset usage statistics |
+| `/api/v1/analytics/popular` | GET | Most popular datasets |
+| `/api/v1/analytics/stale` | GET | Stale/unused datasets |
+| `/api/v1/audit` | GET | Query audit log |
+| `/api/v1/datasets/:name/freshness` | GET/POST | Freshness SLA config |
+
+---
+
 ## Phase 3: Web UI & Community Launch (Q2-Q3 2025)
 
 **Goal:** Prepare for public launch with web UI and community infrastructure.
@@ -472,9 +532,13 @@ Features suggested by the community (not yet prioritized):
 | 0.4.0   | Jan 2025     | ✓ Released   | Security features (rate limiting)      |
 | 0.4.1   | Jan 2025     | ✓ Released   | Async emitter benchmarks               |
 | 0.4.2   | Jan 2025     | ✓ Released   | API key authentication                 |
-| 0.5.0   | Q2 2025      | Planned      | Async backends + emulator tests        |
-| 0.6.0   | Q2-Q3 2025   | Planned      | Web UI + community launch              |
-| 1.0.0   | Q1 2026      | Planned      | Stable release + enterprise features   |
+| 0.5.0   | Q1 2025      | ✓ Released   | CI enhancements + Delta integration    |
+| 0.6.0   | Q1 2025      | ✓ Released   | Enterprise feature activation          |
+| 0.7.0   | Q4 2025      | ✓ Released   | Governance & Delta enhancement         |
+| 0.8.0   | Q2-Q3 2025   | Planned      | Multi-tenant foundation                |
+| 0.9.0   | Q3 2025      | Planned      | Quality checks & automation            |
+| 1.0.0   | Q4 2025      | Planned      | Stable release                         |
+| 1.1.0   | Q1 2026      | Planned      | Web UI + lineage visualization         |
 
 ---
 
@@ -515,4 +579,4 @@ We'll track these metrics to measure progress:
 
 ---
 
-**Last Updated:** 2025-01-21
+**Last Updated:** 2025-11-29

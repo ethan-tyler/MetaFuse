@@ -546,6 +546,7 @@ pub struct ApiKeyInfo {
 ///
 /// This ensures invalid keys don't get elevated rate limits.
 #[allow(dead_code)]
+#[allow(unused_mut)] // req is only mutated when rate-limiting feature is enabled
 pub async fn api_key_identity_middleware(
     axum::extract::Extension(manager): axum::extract::Extension<Arc<ApiKeyManager>>,
     mut req: axum::extract::Request,
