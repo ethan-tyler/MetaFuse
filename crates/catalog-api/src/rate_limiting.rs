@@ -109,12 +109,26 @@ pub enum TenantTier {
 
 impl TenantTier {
     /// Parse tier from string.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_tier(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "free" => TenantTier::Free,
             "premium" => TenantTier::Premium,
             "enterprise" => TenantTier::Enterprise,
             _ => TenantTier::Standard, // Default to standard
+        }
+    }
+}
+
+impl std::str::FromStr for TenantTier {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "free" => Ok(TenantTier::Free),
+            "standard" => Ok(TenantTier::Standard),
+            "premium" => Ok(TenantTier::Premium),
+            "enterprise" => Ok(TenantTier::Enterprise),
+            other => Err(format!("Unknown tier: {}", other)),
         }
     }
 }

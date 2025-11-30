@@ -180,17 +180,20 @@ impl TenantBackend {
 /// Holds the connection permit for the duration of a request.
 ///
 /// This is stored in request extensions to ensure the permit stays alive
-/// until the response is sent. Not cloneable - one permit per request.
+/// until the response is sent. Wrapped in Arc to satisfy Extension's Clone requirement.
+#[derive(Clone)]
 #[cfg(feature = "api-keys")]
 pub struct TenantConnectionPermit {
-    _handle: TenantBackendHandle,
+    _handle: Arc<TenantBackendHandle>,
 }
 
 #[cfg(feature = "api-keys")]
 impl TenantConnectionPermit {
     /// Create a permit holder from a backend handle.
     pub fn new(handle: TenantBackendHandle) -> Self {
-        Self { _handle: handle }
+        Self {
+            _handle: Arc::new(handle),
+        }
     }
 }
 
@@ -353,6 +356,124 @@ pub fn resolve_backend(
         Some(tb) => Arc::clone(tb.backend()),
         None => Arc::clone(default_backend),
     }
+}
+
+/// Error response type for RBAC permission checks.
+///
+/// This matches the ErrorResponse used in main.rs handlers.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RbacErrorResponse {
+    pub error: String,
+    pub request_id: String,
+}
+
+/// Get the tenant ID for logging, preferring ResolvedTenant over TenantBackend.
+///
+/// This ensures audit logs reflect the authenticated tenant identity, not just
+/// the storage handle. Falls back to "default" when running in single-tenant mode.
+#[cfg(feature = "api-keys")]
+pub fn get_tenant_id_for_logging<'a>(
+    resolved_tenant: Option<&'a ResolvedTenant>,
+    tenant_backend: Option<&'a TenantBackend>,
+) -> &'a str {
+    if let Some(tenant) = resolved_tenant {
+        tenant.tenant_id()
+    } else if let Some(tb) = tenant_backend {
+        tb.tenant_id()
+    } else {
+        "default"
+    }
+}
+
+/// Get the tenant ID for logging (non-api-keys feature version).
+#[cfg(not(feature = "api-keys"))]
+pub fn get_tenant_id_for_logging<'a>(
+    _resolved_tenant: Option<&'a ()>,
+    tenant_backend: Option<&'a TenantBackend>,
+) -> &'a str {
+    if let Some(tb) = tenant_backend {
+        tb.tenant_id()
+    } else {
+        "default"
+    }
+}
+
+/// Check if the request has write permission in multi-tenant mode.
+///
+/// Returns Ok(()) if:
+/// - Multi-tenant mode is disabled (no ResolvedTenant present), OR
+/// - The ResolvedTenant has write permission (Editor or Admin role)
+///
+/// Returns Err with a 403 Forbidden response if write permission is denied.
+#[cfg(feature = "api-keys")]
+pub fn require_write_permission(
+    resolved_tenant: Option<&ResolvedTenant>,
+    request_id: &str,
+) -> std::result::Result<(), (axum::http::StatusCode, axum::Json<RbacErrorResponse>)> {
+    if let Some(tenant) = resolved_tenant {
+        if !tenant.can_write() {
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(RbacErrorResponse {
+                    error: "Write permission denied. Requires Editor or Admin role.".to_string(),
+                    request_id: request_id.to_string(),
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check if the request has delete permission in multi-tenant mode.
+///
+/// Returns Ok(()) if:
+/// - Multi-tenant mode is disabled (no ResolvedTenant present), OR
+/// - The ResolvedTenant has delete permission (Admin role)
+///
+/// Returns Err with a 403 Forbidden response if delete permission is denied.
+#[cfg(feature = "api-keys")]
+pub fn require_delete_permission(
+    resolved_tenant: Option<&ResolvedTenant>,
+    request_id: &str,
+) -> std::result::Result<(), (axum::http::StatusCode, axum::Json<RbacErrorResponse>)> {
+    if let Some(tenant) = resolved_tenant {
+        if !tenant.can_delete() {
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(RbacErrorResponse {
+                    error: "Delete permission denied. Requires Admin role.".to_string(),
+                    request_id: request_id.to_string(),
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Check if the request has API key management permission in multi-tenant mode.
+///
+/// Returns Ok(()) if:
+/// - Multi-tenant mode is disabled (no ResolvedTenant present), OR
+/// - The ResolvedTenant has key management permission (Admin role)
+///
+/// Returns Err with a 403 Forbidden response if permission is denied.
+#[cfg(feature = "api-keys")]
+pub fn require_admin_permission(
+    resolved_tenant: Option<&ResolvedTenant>,
+    request_id: &str,
+) -> std::result::Result<(), (axum::http::StatusCode, axum::Json<RbacErrorResponse>)> {
+    if let Some(tenant) = resolved_tenant {
+        if !tenant.can_manage_keys() {
+            return Err((
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(RbacErrorResponse {
+                    error: "Admin permission denied. Requires Admin role.".to_string(),
+                    request_id: request_id.to_string(),
+                }),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Middleware to inject tenant-specific backend into request extensions.

@@ -63,7 +63,7 @@ use tracing::{debug, warn};
 /// Configuration for the tenant resolver middleware.
 ///
 /// Controls security-sensitive behavior like header-only resolution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TenantResolverConfig {
     /// Allow header-only tenant resolution (X-Tenant-ID without API key).
     ///
@@ -73,14 +73,6 @@ pub struct TenantResolverConfig {
     ///
     /// Default: `false`
     pub allow_header_only_resolution: bool,
-}
-
-impl Default for TenantResolverConfig {
-    fn default() -> Self {
-        Self {
-            allow_header_only_resolution: false, // Secure default
-        }
-    }
 }
 
 impl TenantResolverConfig {
@@ -157,6 +149,16 @@ impl ResolvedTenant {
             role: Some(key.role),
             source: TenantSource::Both,
         })
+    }
+
+    /// Create a new resolved tenant for testing purposes
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_testing(tenant_id: &str, role: Option<TenantRole>, source: TenantSource) -> Self {
+        Self {
+            context: TenantContext::new(tenant_id).expect("Invalid tenant ID for testing"),
+            role,
+            source,
+        }
     }
 
     /// Get the tenant ID
@@ -769,7 +771,7 @@ mod tests {
         };
         assert!(editor.can_read());
         assert!(editor.can_write());
-        assert!(editor.can_delete());
+        assert!(!editor.can_delete()); // Only Admin can delete
         assert!(!editor.can_manage_keys());
 
         // Viewer role

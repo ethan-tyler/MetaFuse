@@ -107,7 +107,7 @@ impl TenantRole {
 
     /// Check if role can delete data.
     pub fn can_delete(&self) -> bool {
-        matches!(self, TenantRole::Admin | TenantRole::Editor)
+        matches!(self, TenantRole::Admin)
     }
 
     /// Check if role can manage API keys.
@@ -1112,6 +1112,7 @@ impl ControlPlane {
 
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path)?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
             conn.execute(
                 "INSERT INTO tenant_api_keys (tenant_id, key_hash, name, role, expires_at)
@@ -1478,7 +1479,7 @@ mod tests {
 
         assert!(TenantRole::Editor.can_read());
         assert!(TenantRole::Editor.can_write());
-        assert!(TenantRole::Editor.can_delete());
+        assert!(!TenantRole::Editor.can_delete()); // Only Admin can delete
         assert!(!TenantRole::Editor.can_manage_keys());
 
         assert!(TenantRole::Viewer.can_read());
@@ -1669,39 +1670,275 @@ mod tests {
         assert!(audit_logs.len() >= 5); // create, update, suspend, reactivate, delete, purge
     }
 
-    // TODO: Re-enable when API key endpoints are implemented
-    // This test requires: create_tenant_api_key, validate_tenant_api_key,
-    // list_tenant_api_keys, revoke_tenant_api_key
-    // See original test body in git history for expected behavior
     #[tokio::test]
     #[cfg(feature = "api-keys")]
-    #[ignore = "Requires unimplemented API key endpoints"]
     async fn test_tenant_api_keys() {
-        // Placeholder - test body removed due to missing API
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("control.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = temp_dir
+            .path()
+            .join("{tenant_id}/db")
+            .to_string_lossy()
+            .to_string();
+
+        let cp = ControlPlane::new(db_path, storage).unwrap();
+        cp.initialize().await.unwrap();
+
+        // Create tenant and initial admin key
+        let (_tenant, admin_key) = cp
+            .create_tenant(
+                CreateTenantRequest {
+                    tenant_id: "tenant1".to_string(),
+                    display_name: "Tenant One".to_string(),
+                    admin_email: "admin@test.com".to_string(),
+                    tier: Some("standard".to_string()),
+                    quota_max_datasets: None,
+                    quota_max_storage_bytes: None,
+                    quota_max_api_calls_per_hour: None,
+                },
+                AuditContext {
+                    actor: "platform-admin".to_string(),
+                    request_id: None,
+                    client_ip: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Validate admin key
+        let validated = cp.validate_tenant_api_key(&admin_key).await.unwrap();
+        let validated = validated.expect("admin key should validate");
+        assert_eq!(validated.tenant_id, "tenant1");
+        assert_eq!(validated.role, TenantRole::Admin);
+
+        // List keys (should include admin)
+        let keys = cp.list_tenant_api_keys("tenant1").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].role, "admin");
+
+        // Create an editor key
+        let editor_key = cp
+            .create_tenant_api_key(
+                "tenant1",
+                "editor-key".to_string(),
+                TenantRole::Editor,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Validate editor key
+        let validated = cp.validate_tenant_api_key(&editor_key).await.unwrap();
+        let validated = validated.expect("editor key should validate");
+        assert_eq!(validated.role, TenantRole::Editor);
+
+        // List keys again (should include both)
+        let keys = cp.list_tenant_api_keys("tenant1").await.unwrap();
+        assert_eq!(keys.len(), 2);
+        let editor = keys.iter().find(|k| k.name == "editor-key").unwrap();
+
+        // Revoke editor key
+        let revoked = cp
+            .revoke_tenant_api_key("tenant1", editor.id)
+            .await
+            .unwrap();
+        assert!(revoked);
+
+        // Editor key should no longer validate
+        let validated = cp.validate_tenant_api_key(&editor_key).await.unwrap();
+        assert!(validated.is_none());
     }
 
     // ==========================================================================
     // Status-Based API Key Rejection Tests
-    // TODO: Re-enable when API key endpoints are implemented
-    // These tests require: create_tenant_api_key, validate_tenant_api_key, key_cache
     // ==========================================================================
 
     #[tokio::test]
-    #[ignore = "Requires unimplemented API key endpoints"]
+    #[cfg(feature = "api-keys")]
     async fn test_api_key_rejected_when_tenant_suspended() {
-        // Placeholder - test validates that API keys stop working when tenant is suspended
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("control.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = temp_dir
+            .path()
+            .join("{tenant_id}/db")
+            .to_string_lossy()
+            .to_string();
+
+        let cp = ControlPlane::new(db_path, storage).unwrap();
+        cp.initialize().await.unwrap();
+
+        let (_tenant, key) = cp
+            .create_tenant(
+                CreateTenantRequest {
+                    tenant_id: "suspendme".to_string(),
+                    display_name: "Tenant Suspend".to_string(),
+                    admin_email: "admin@test.com".to_string(),
+                    tier: None,
+                    quota_max_datasets: None,
+                    quota_max_storage_bytes: None,
+                    quota_max_api_calls_per_hour: None,
+                },
+                AuditContext {
+                    actor: "platform-admin".to_string(),
+                    request_id: None,
+                    client_ip: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Key works before suspension
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_some());
+
+        // Suspend tenant
+        cp.suspend_tenant(
+            "suspendme",
+            AuditContext {
+                actor: "platform-admin".to_string(),
+                request_id: None,
+                client_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Key should now be rejected
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    #[ignore = "Requires unimplemented API key endpoints"]
+    #[cfg(feature = "api-keys")]
     async fn test_api_key_rejected_when_tenant_pending_deletion() {
-        // Placeholder - test validates that API keys stop working when tenant is deleted
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("control.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = temp_dir
+            .path()
+            .join("{tenant_id}/db")
+            .to_string_lossy()
+            .to_string();
+
+        let cp = ControlPlane::new(db_path, storage).unwrap();
+        cp.initialize().await.unwrap();
+
+        let (_tenant, key) = cp
+            .create_tenant(
+                CreateTenantRequest {
+                    tenant_id: "deleteme".to_string(),
+                    display_name: "Tenant Delete".to_string(),
+                    admin_email: "admin@test.com".to_string(),
+                    tier: None,
+                    quota_max_datasets: None,
+                    quota_max_storage_bytes: None,
+                    quota_max_api_calls_per_hour: None,
+                },
+                AuditContext {
+                    actor: "platform-admin".to_string(),
+                    request_id: None,
+                    client_ip: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Key works before deletion
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_some());
+
+        // Delete (soft) tenant
+        cp.delete_tenant(
+            "deleteme",
+            AuditContext {
+                actor: "platform-admin".to_string(),
+                request_id: None,
+                client_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Key should now be rejected
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    #[ignore = "Requires unimplemented API key endpoints"]
+    #[cfg(feature = "api-keys")]
     async fn test_api_key_works_after_reactivation() {
-        // Placeholder - test validates that API keys work again after tenant reactivation
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("control.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = temp_dir
+            .path()
+            .join("{tenant_id}/db")
+            .to_string_lossy()
+            .to_string();
+
+        let cp = ControlPlane::new(db_path, storage).unwrap();
+        cp.initialize().await.unwrap();
+
+        let (_tenant, key) = cp
+            .create_tenant(
+                CreateTenantRequest {
+                    tenant_id: "reactivate".to_string(),
+                    display_name: "Tenant Reactivate".to_string(),
+                    admin_email: "admin@test.com".to_string(),
+                    tier: None,
+                    quota_max_datasets: None,
+                    quota_max_storage_bytes: None,
+                    quota_max_api_calls_per_hour: None,
+                },
+                AuditContext {
+                    actor: "platform-admin".to_string(),
+                    request_id: None,
+                    client_ip: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Works initially
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_some());
+
+        // Suspend
+        cp.suspend_tenant(
+            "reactivate",
+            AuditContext {
+                actor: "platform-admin".to_string(),
+                request_id: None,
+                client_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_none());
+
+        // Reactivate
+        cp.reactivate_tenant(
+            "reactivate",
+            AuditContext {
+                actor: "platform-admin".to_string(),
+                request_id: None,
+                client_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Key works again
+        assert!(cp.validate_tenant_api_key(&key).await.unwrap().is_some());
     }
 
     // ==========================================================================
@@ -1767,14 +2004,91 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Requires unimplemented API key endpoints"]
+    #[cfg(feature = "api-keys")]
     async fn test_multiple_api_keys_per_tenant_allowed() {
-        // Placeholder - test validates that tenants can have multiple API keys
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("control.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = temp_dir
+            .path()
+            .join("{tenant_id}/db")
+            .to_string_lossy()
+            .to_string();
+
+        let cp = ControlPlane::new(db_path, storage).unwrap();
+        cp.initialize().await.unwrap();
+
+        let (_tenant, admin_key) = cp
+            .create_tenant(
+                CreateTenantRequest {
+                    tenant_id: "multi-keys".to_string(),
+                    display_name: "Multi Keys".to_string(),
+                    admin_email: "admin@test.com".to_string(),
+                    tier: None,
+                    quota_max_datasets: None,
+                    quota_max_storage_bytes: None,
+                    quota_max_api_calls_per_hour: None,
+                },
+                AuditContext::default(),
+            )
+            .await
+            .unwrap();
+
+        // Create two additional keys
+        let editor_key = cp
+            .create_tenant_api_key(
+                "multi-keys",
+                "editor".to_string(),
+                TenantRole::Editor,
+                None,
+            )
+            .await
+            .unwrap();
+        let viewer_key = cp
+            .create_tenant_api_key(
+                "multi-keys",
+                "viewer".to_string(),
+                TenantRole::Viewer,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Validate all keys work
+        assert!(cp.validate_tenant_api_key(&admin_key).await.unwrap().is_some());
+        assert!(cp.validate_tenant_api_key(&editor_key).await.unwrap().is_some());
+        assert!(cp.validate_tenant_api_key(&viewer_key).await.unwrap().is_some());
+
+        // List keys should include all three
+        let keys = cp.list_tenant_api_keys("multi-keys").await.unwrap();
+        assert_eq!(keys.len(), 3);
     }
 
     #[tokio::test]
-    #[ignore = "Requires unimplemented API key endpoints"]
+    #[cfg(feature = "api-keys")]
     async fn test_api_key_for_nonexistent_tenant_rejected() {
-        // Placeholder - test validates that creating API key for non-existent tenant fails
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir
+            .path()
+            .join("control.db")
+            .to_string_lossy()
+            .to_string();
+        let storage = temp_dir
+            .path()
+            .join("{tenant_id}/db")
+            .to_string_lossy()
+            .to_string();
+
+        let cp = ControlPlane::new(db_path, storage).unwrap();
+        cp.initialize().await.unwrap();
+
+        // Attempt to create API key for a tenant that does not exist should fail
+        let result = cp
+            .create_tenant_api_key("missing", "missing".to_string(), TenantRole::Admin, None)
+            .await;
+        assert!(result.is_err());
     }
 }

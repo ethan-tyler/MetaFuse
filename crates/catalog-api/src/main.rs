@@ -22,6 +22,15 @@ mod quality;
 #[cfg(feature = "classification")]
 mod classification;
 
+// Multi-Tenant Integration
+mod multi_tenant;
+
+#[cfg(feature = "api-keys")]
+mod control_plane;
+
+#[cfg(feature = "api-keys")]
+mod tenant_resolver;
+
 use axum::{
     extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
@@ -43,6 +52,15 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+// Multi-tenant imports
+use multi_tenant::{MultiTenantConfig, MultiTenantResources, TenantBackend, resolve_backend};
+
+#[cfg(feature = "api-keys")]
+use multi_tenant::{require_write_permission, require_delete_permission};
+
+#[cfg(feature = "api-keys")]
+use tenant_resolver::{TenantResolverConfig, ResolvedTenant};
+
 /// Request ID for tracking requests through the system
 #[derive(Debug, Clone)]
 struct RequestId(String);
@@ -55,6 +73,8 @@ struct AppState {
     audit_logger: audit::AuditLogger,
     #[cfg(feature = "usage-analytics")]
     usage_tracker: Arc<usage_analytics::UsageTracker>,
+    /// Multi-tenant resources (factory and control plane)
+    multi_tenant: MultiTenantResources,
 }
 
 impl Clone for AppState {
@@ -66,6 +86,7 @@ impl Clone for AppState {
             audit_logger: self.audit_logger.clone(),
             #[cfg(feature = "usage-analytics")]
             usage_tracker: Arc::clone(&self.usage_tracker),
+            multi_tenant: self.multi_tenant.clone(),
         }
     }
 }
@@ -141,6 +162,20 @@ struct OperationalMetaResponse {
 struct ErrorResponse {
     error: String,
     request_id: String,
+}
+
+/// Convert RBAC error responses to the standard ErrorResponse type
+#[cfg(feature = "api-keys")]
+fn rbac_error(
+    (status, json): (StatusCode, Json<multi_tenant::RbacErrorResponse>),
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            error: json.error.clone(),
+            request_id: json.request_id.clone(),
+        }),
+    )
 }
 
 // =============================================================================
@@ -737,6 +772,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracker
     };
 
+    // Initialize multi-tenant resources
+    let mt_config = MultiTenantConfig::from_env();
+    mt_config.validate()?;
+    let multi_tenant = MultiTenantResources::new(&mt_config).await?;
+    if multi_tenant.is_enabled() {
+        tracing::info!(
+            storage_template = %mt_config.storage_uri_template,
+            cache_capacity = mt_config.cache_capacity,
+            "Multi-tenant mode enabled"
+        );
+    }
+
     let state = AppState {
         backend,
         delta_reader,
@@ -744,6 +791,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audit_logger,
         #[cfg(feature = "usage-analytics")]
         usage_tracker,
+        multi_tenant,
     };
 
     // Build router with conditional feature routes
@@ -890,6 +938,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Always run to make AuditContext available to handlers
     let app = app.layer(middleware::from_fn(audit_context_middleware));
 
+    // Add multi-tenant middleware if enabled (requires api-keys feature)
+    #[cfg(feature = "api-keys")]
+    let app = if mt_config.enabled {
+        use tenant_resolver::{tenant_resolver_middleware, require_tenant_middleware};
+        use multi_tenant::tenant_backend_middleware;
+
+        let factory = state.multi_tenant.factory().expect("factory required when enabled").clone();
+        let control_plane = state.multi_tenant.control_plane().expect("control plane required when enabled").clone();
+        let resolver_config = TenantResolverConfig::default();
+
+        tracing::info!("Multi-tenant middleware enabled for API routes");
+
+        // Middleware layers applied in reverse order (last added = first executed):
+        // 1. tenant_resolver_middleware - Resolves tenant from API key or X-Tenant-ID header
+        // 2. require_tenant_middleware - Rejects requests without valid tenant context (401)
+        // 3. tenant_backend_middleware - Gets tenant-specific backend for resolved tenant
+        app.layer(middleware::from_fn(tenant_backend_middleware))
+            .layer(middleware::from_fn(require_tenant_middleware))
+            .layer(middleware::from_fn(tenant_resolver_middleware))
+            .layer(Extension(factory))
+            .layer(Extension(control_plane))
+            .layer(Extension(resolver_config))
+    } else {
+        app
+    };
+
     let app = app.layer(CorsLayer::permissive()).with_state(state);
 
     // Get port from environment or use default
@@ -1000,16 +1074,19 @@ async fn health_check() -> &'static str {
 async fn list_datasets(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
-        tenant = ?params.get("tenant"),
-        domain = ?params.get("domain"),
+        tenant_id = %tenant_id,
+        filter_tenant = ?params.get("tenant"),
+        filter_domain = ?params.get("domain"),
         "Listing datasets with filters"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1087,6 +1164,7 @@ async fn list_datasets(
 async fn get_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Result<Json<ExtendedDatasetResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -1094,7 +1172,9 @@ async fn get_dataset(
     let includes =
         IncludeOptions::parse(&params.include).map_err(|e| bad_request(e, request_id.0.clone()))?;
 
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         dataset_name = %name,
         include_delta = includes.delta,
         include_quality = includes.quality,
@@ -1107,9 +1187,9 @@ async fn get_dataset(
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
     // Perform all synchronous database operations in a block to properly scope borrows
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
     let (dataset, fields, tags, upstream_datasets, downstream_datasets, quality_info) = {
-        let conn = state
-            .backend
+        let conn = backend
             .get_connection()
             .await
             .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1344,20 +1424,22 @@ async fn get_dataset(
 async fn search_datasets(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
     let query = params
         .get("q")
         .ok_or_else(|| bad_request("Missing 'q' parameter".to_string(), request_id.0.clone()))?;
 
-    tracing::debug!(search_query = %query, "Executing full-text search");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, search_query = %query, "Executing full-text search");
 
     // Validate FTS query (operators are allowed for powerful search)
     let validated_query = validation::validate_fts_query(query)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1434,9 +1516,12 @@ async fn search_datasets(
 async fn list_audit_logs(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<audit::AuditQueryParams>,
 ) -> Result<Json<audit::AuditLogResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         entity_type = ?params.entity_type,
         entity_id = ?params.entity_id,
         action = ?params.action,
@@ -1445,8 +1530,8 @@ async fn list_audit_logs(
         "Querying audit logs"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1509,17 +1594,20 @@ fn default_stale_threshold() -> i64 {
 async fn get_dataset_usage(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Query(params): Query<usage_analytics::UsageQueryParams>,
 ) -> Result<Json<usage_analytics::DatasetUsageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         dataset_name = %name,
         period = %params.period,
         "Querying dataset usage"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1571,16 +1659,19 @@ async fn get_dataset_usage(
 async fn get_popular_datasets(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<PopularQueryParams>,
 ) -> Result<Json<usage_analytics::PopularDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         limit = params.limit,
         period = %params.period,
         "Querying popular datasets"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1610,15 +1701,18 @@ async fn get_popular_datasets(
 async fn get_stale_datasets(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<StaleQueryParams>,
 ) -> Result<Json<usage_analytics::StaleDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         threshold_days = params.threshold_days,
         "Querying stale datasets"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1661,12 +1755,14 @@ fn default_unhealthy_threshold() -> f64 {
 async fn get_dataset_quality(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<quality::QualityResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset_name = %name, "Getting dataset quality");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset_name = %name, "Getting dataset quality");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1711,14 +1807,17 @@ async fn get_dataset_quality(
 async fn compute_dataset_quality(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<quality::QualityResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::info!(dataset_name = %name, "Computing dataset quality");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::info!(tenant_id = %tenant_id, dataset_name = %name, "Computing dataset quality");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
 
     // First, look up the dataset and get delta_location (sync DB operation)
     let (dataset_id, dataset_name, delta_location) = {
-        let conn = state
-            .backend
+        let conn = backend
             .get_connection()
             .await
             .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1762,8 +1861,7 @@ async fn compute_dataset_quality(
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     // Now compute and store scores (sync DB operations)
-    let conn = state
-        .backend
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1796,12 +1894,14 @@ async fn compute_dataset_quality(
 async fn get_unhealthy_datasets(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<UnhealthyQueryParams>,
 ) -> Result<Json<quality::UnhealthyDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(threshold = params.threshold, "Querying unhealthy datasets");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, threshold = params.threshold, "Querying unhealthy datasets");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1827,13 +1927,15 @@ async fn get_unhealthy_datasets(
 async fn get_dataset_classifications(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
 {
-    tracing::debug!(dataset_name = %name, "Getting dataset classifications");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset_name = %name, "Getting dataset classifications");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -1901,13 +2003,15 @@ async fn get_dataset_classifications(
 async fn scan_dataset_classifications(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
 {
-    tracing::info!(dataset_name = %name, "Scanning dataset for classifications");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::info!(tenant_id = %tenant_id, dataset_name = %name, "Scanning dataset for classifications");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2006,11 +2110,13 @@ async fn scan_dataset_classifications(
 async fn get_all_pii_columns(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
 ) -> Result<Json<classification::PiiColumnsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!("Getting all PII columns");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, "Getting all PII columns");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2045,13 +2151,15 @@ async fn get_all_pii_columns(
 async fn set_field_classification(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(field_id): Path<i64>,
     Json(req): Json<classification::SetClassificationRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::info!(field_id, classification = %req.classification, "Setting manual classification");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::info!(tenant_id = %tenant_id, field_id, classification = %req.classification, "Setting manual classification");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2163,16 +2271,34 @@ async fn create_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Json(req): Json<CreateDatasetRequest>,
 ) -> Result<(StatusCode, Json<DatasetResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %req.name, "Creating dataset");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %req.name, "Creating dataset");
 
     // Validate inputs
     validation::validate_dataset_name(&req.name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2403,16 +2529,34 @@ async fn update_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(name): Path<String>,
     Json(req): Json<UpdateDatasetRequest>,
 ) -> Result<Json<DatasetResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, "Updating dataset");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %name, "Updating dataset");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2558,15 +2702,33 @@ async fn delete_dataset(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, "Deleting dataset");
+    // Check delete permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %name, "Deleting dataset");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2616,16 +2778,34 @@ async fn add_tags(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(name): Path<String>,
     Json(req): Json<AddTagsRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, tags = ?req.tags, "Adding tags to dataset");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %name, tags = ?req.tags, "Adding tags to dataset");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2686,16 +2866,34 @@ async fn remove_tags(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(name): Path<String>,
     Json(req): Json<RemoveTagsRequest>,
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, tags = ?req.tags, "Removing tags from dataset");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %name, tags = ?req.tags, "Removing tags from dataset");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2760,12 +2958,30 @@ async fn create_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Json(req): Json<CreateOwnerRequest>,
 ) -> Result<(StatusCode, Json<OwnerResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(owner_id = %req.owner_id, "Creating owner");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, owner_id = %req.owner_id, "Creating owner");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2838,16 +3054,19 @@ async fn create_owner(
 async fn list_owners(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<Vec<OwnerResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         limit = pagination.limit(),
         offset = pagination.offset(),
         "Listing owners"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2892,12 +3111,14 @@ async fn list_owners(
 async fn get_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<String>,
 ) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(owner_id = %id, "Getting owner");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, owner_id = %id, "Getting owner");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -2934,13 +3155,31 @@ async fn update_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<String>,
     Json(req): Json<UpdateOwnerRequest>,
 ) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(owner_id = %id, "Updating owner");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, owner_id = %id, "Updating owner");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3041,12 +3280,30 @@ async fn delete_owner(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(owner_id = %id, "Deleting owner");
+    // Check delete permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, owner_id = %id, "Deleting owner");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3087,12 +3344,14 @@ async fn delete_owner(
 async fn list_domains(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<DomainResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!("Listing domains");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, "Listing domains");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3140,9 +3399,27 @@ async fn create_domain(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Json(req): Json<CreateDomainRequest>,
 ) -> Result<(StatusCode, Json<DomainResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %req.name, "Creating domain");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %req.name, "Creating domain");
 
     // Validate domain name (lowercase alphanumeric with hyphens/underscores)
     if !req
@@ -3163,8 +3440,8 @@ async fn create_domain(
         ));
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3236,12 +3513,14 @@ async fn create_domain(
 async fn get_domain(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<DomainResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, "Getting domain");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, name = %name, "Getting domain");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3280,13 +3559,31 @@ async fn update_domain(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(name): Path<String>,
     Json(req): Json<UpdateDomainRequest>,
 ) -> Result<Json<DomainResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, "Updating domain");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %name, "Updating domain");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3384,12 +3681,30 @@ async fn delete_domain(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %name, "Deleting domain");
+    // Check delete permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %name, "Deleting domain");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3446,13 +3761,15 @@ async fn delete_domain(
 async fn list_domain_datasets(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(domain = %name, "Listing datasets in domain");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, domain = %name, "Listing datasets in domain");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3531,12 +3848,14 @@ async fn list_domain_datasets(
 async fn list_glossary_terms(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<GlossaryTermResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!("Listing glossary terms");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, "Listing glossary terms");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3588,9 +3907,27 @@ async fn create_glossary_term(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Json(req): Json<CreateGlossaryTermRequest>,
 ) -> Result<(StatusCode, Json<GlossaryTermResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(term = %req.term, "Creating glossary term");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, term = %req.term, "Creating glossary term");
 
     // Validate term
     if req.term.trim().is_empty() {
@@ -3621,8 +3958,8 @@ async fn create_glossary_term(
         }
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3687,12 +4024,14 @@ async fn create_glossary_term(
 async fn get_glossary_term(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<i64>,
 ) -> Result<Json<GlossaryTermResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(id, "Getting glossary term");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, id, "Getting glossary term");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3742,10 +4081,28 @@ async fn update_glossary_term(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateGlossaryTermRequest>,
 ) -> Result<Json<GlossaryTermResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(id, "Updating glossary term");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, id, "Updating glossary term");
 
     // Validate term if provided
     if let Some(ref term) = req.term {
@@ -3771,8 +4128,8 @@ async fn update_glossary_term(
         }
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3899,12 +4256,30 @@ async fn delete_glossary_term(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(id, "Deleting glossary term");
+    // Check delete permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, id, "Deleting glossary term");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -3950,12 +4325,14 @@ async fn delete_glossary_term(
 async fn get_term_links(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<TermLinkResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(term_id = id, "Getting term links");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, term_id = id, "Getting term links");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4012,10 +4389,28 @@ async fn link_term(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<i64>,
     Json(req): Json<LinkTermRequest>,
 ) -> Result<(StatusCode, Json<TermLinkResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(term_id = id, ?req.dataset_id, ?req.field_id, "Linking term");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, term_id = id, ?req.dataset_id, ?req.field_id, "Linking term");
 
     // Validate - must provide exactly one of dataset_id or field_id
     match (&req.dataset_id, &req.field_id) {
@@ -4034,8 +4429,8 @@ async fn link_term(
         _ => {}
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4144,10 +4539,28 @@ async fn unlink_term(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<i64>,
     Json(req): Json<LinkTermRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(term_id = id, ?req.dataset_id, ?req.field_id, "Unlinking term");
+    // Check delete permission in multi-tenant mode (unlinking is a delete-style operation)
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, term_id = id, ?req.dataset_id, ?req.field_id, "Unlinking term");
 
     // Validate - must provide exactly one of dataset_id or field_id
     match (&req.dataset_id, &req.field_id) {
@@ -4166,8 +4579,8 @@ async fn unlink_term(
         _ => {}
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4239,9 +4652,12 @@ async fn create_lineage_edge(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Json(req): Json<CreateLineageEdgeRequest>,
 ) -> Result<(StatusCode, Json<LineageEdgeResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         source = %req.source_dataset,
         target = %req.target_dataset,
         "Creating lineage edge"
@@ -4252,8 +4668,8 @@ async fn create_lineage_edge(
     validation::validate_dataset_name(&req.target_dataset)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4343,16 +4759,34 @@ async fn create_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Json(req): Json<CreateGovernanceRuleRequest>,
 ) -> Result<(StatusCode, Json<GovernanceRuleResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(name = %req.name, "Creating governance rule");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, name = %req.name, "Creating governance rule");
 
     // Validate rule type
     validation::validate_rule_type(&req.rule_type)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4423,16 +4857,19 @@ async fn create_governance_rule(
 async fn list_governance_rules(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<Vec<GovernanceRuleResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         limit = pagination.limit(),
         offset = pagination.offset(),
         "Listing governance rules"
     );
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4477,12 +4914,14 @@ async fn list_governance_rules(
 async fn get_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<i64>,
 ) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(id = %id, "Getting governance rule");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, id = %id, "Getting governance rule");
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4524,10 +4963,28 @@ async fn update_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateGovernanceRuleRequest>,
 ) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(id = %id, "Updating governance rule");
+    // Check write permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_write_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
+
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, id = %id, "Updating governance rule");
 
     // Validate rule type if provided
     if let Some(ref rule_type) = req.rule_type {
@@ -4535,8 +4992,8 @@ async fn update_governance_rule(
             .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4641,12 +5098,30 @@ async fn delete_governance_rule(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+    #[cfg(feature = "api-keys")] resolved_tenant: Option<Extension<ResolvedTenant>>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(id = %id, "Deleting governance rule");
+    // Check delete permission in multi-tenant mode
+    #[cfg(feature = "api-keys")]
+    require_delete_permission(
+        resolved_tenant.as_ref().map(|e| &e.0),
+        &request_id.0,
+    ).map_err(rbac_error)?;
 
-    let conn = state
-        .backend
+    #[cfg(feature = "api-keys")]
+    let tenant_id = resolved_tenant
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
+        .unwrap_or("default");
+    #[cfg(not(feature = "api-keys"))]
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+
+    tracing::debug!(tenant_id = %tenant_id, id = %id, "Deleting governance rule");
+
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4687,10 +5162,12 @@ async fn delete_governance_rule(
 async fn create_quality_metric(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Json(req): Json<CreateQualityMetricRequest>,
 ) -> Result<(StatusCode, Json<QualityMetricResponse>), (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, "Creating quality metric");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Creating quality metric");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
@@ -4713,8 +5190,8 @@ async fn create_quality_metric(
             .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4776,15 +5253,17 @@ async fn create_quality_metric(
 async fn list_quality_metrics(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<QualityMetricResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, "Listing quality metrics");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Listing quality metrics");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4844,16 +5323,18 @@ async fn set_freshness_config(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     Extension(audit_context): Extension<AuditContext>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Json(req): Json<SetFreshnessConfigRequest>,
 ) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, "Setting freshness config");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Setting freshness config");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -4956,15 +5437,17 @@ async fn set_freshness_config(
 async fn get_freshness_config(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, "Getting freshness config");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Getting freshness config");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -5021,16 +5504,18 @@ async fn get_freshness_config(
 async fn get_dataset_schema(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Query(params): Query<SchemaQueryParams>,
 ) -> Result<Json<SchemaResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, version = ?params.version, "Getting dataset schema from Delta");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, version = ?params.version, "Getting dataset schema from Delta");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -5094,10 +5579,13 @@ async fn get_dataset_schema(
 async fn get_dataset_schema_diff(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Query(params): Query<SchemaDiffQueryParams>,
 ) -> Result<Json<SchemaDiffResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
     tracing::debug!(
+        tenant_id = %tenant_id,
         dataset = %name,
         from = params.from,
         to = params.to,
@@ -5131,8 +5619,8 @@ async fn get_dataset_schema_diff(
         ));
     }
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -5215,15 +5703,17 @@ async fn get_dataset_schema_diff(
 async fn get_dataset_stats(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<StatsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, "Getting dataset stats from Delta");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Getting dataset stats from Delta");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
@@ -5277,16 +5767,18 @@ async fn get_dataset_stats(
 async fn get_dataset_history(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
     Query(params): Query<HistoryQueryParams>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    tracing::debug!(dataset = %name, limit = ?params.limit, "Getting dataset history from Delta");
+    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    tracing::debug!(tenant_id = %tenant_id, dataset = %name, limit = ?params.limit, "Getting dataset history from Delta");
 
     validation::validate_dataset_name(&name)
         .map_err(|e| bad_request(e.to_string(), request_id.0.clone()))?;
 
-    let conn = state
-        .backend
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;

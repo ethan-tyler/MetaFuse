@@ -25,6 +25,8 @@ classification = ["regex"]
 enterprise = ["audit", "usage-analytics", "classification"]
 # Production bundle (enterprise + security)
 production = ["enterprise", "rate-limiting", "api-keys", "metrics"]
+# Test utilities for integration tests
+test-utils = []
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
