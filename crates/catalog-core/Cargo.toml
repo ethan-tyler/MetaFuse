@@ -13,3 +13,4 @@ chrono.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
 datafusion.workspace = true
+tracing.workspace = true

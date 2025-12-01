@@ -1,3 +1,7 @@
+// Allow dead_code for public API items that are used by library consumers
+// but not within the crate itself (middleware building blocks, test utilities)
+#![allow(dead_code)]
+
 //! API Key Authentication Module
 //!
 //! Provides secure API key generation, validation, and management with bcrypt
@@ -546,6 +550,7 @@ pub struct ApiKeyInfo {
 ///
 /// This ensures invalid keys don't get elevated rate limits.
 #[allow(dead_code)]
+#[allow(unused_mut)] // req is only mutated when rate-limiting feature is enabled
 pub async fn api_key_identity_middleware(
     axum::extract::Extension(manager): axum::extract::Extension<Arc<ApiKeyManager>>,
     mut req: axum::extract::Request,

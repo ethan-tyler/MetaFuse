@@ -7,43 +7,257 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### v0.5.0 - Production Hardening & Legacy Removal
+### Phase 7: Multi-Region Foundation & Tenant Metrics
 
-#### BREAKING CHANGES
-
-- **Removed `legacy-sync` feature flag**: The synchronous API adapter has been removed.
-  All code must use async/await APIs introduced in v0.4.0.
-  - If you're on v0.4.x with async APIs: **No changes required**
-  - If you're using `SyncBackendAdapter`: See [MIGRATION-v0.5.md](docs/MIGRATION-v0.5.md) for upgrade path
-
-#### Removed
-
-- Deprecated `sync_adapter` module (`crates/catalog-storage/src/sync_adapter.rs`)
-- `legacy-sync` Cargo feature flag from `catalog-storage`
-- `legacy-sync` feature dependency in `catalog-cli`
-- Legacy v0.3.x code in `MetaFuse/` directory
+This release adds tenant-level observability metrics and foundational multi-region support for control plane tenants.
 
 #### Added
 
-- Cloud emulator tests in CI (GCS with fake-gcs-server, S3 with MinIO)
-  - Gated behind `RUN_CLOUD_TESTS=1` environment variable
-  - Only runs on main repository (not forks)
-  - Serialized execution to prevent port conflicts
-- Cloud backend benchmarks (compile-only in PR CI)
-  - GCS and S3 upload/download performance benchmarks
-  - Cache hit vs miss performance testing
-- Security integration tests for rate limiting and API key authentication
-- Comprehensive v0.5.0 migration guide
+- **Tenant Metrics (Phase 7A)**
+  - Connection pool metrics per tenant (`tenant_active_connections`, `tenant_connection_wait_seconds`)
+  - Cache hit/miss rates (`tenant_backend_cache_hits_total`, `tenant_backend_cache_misses_total`, `tenant_backend_cache_size`)
+  - Circuit breaker state metrics (`tenant_circuit_breaker_state`, `tenant_circuit_breaker_trips_total`)
+  - Tenant lifecycle event counters (`tenant_lifecycle_events_total` with `create`, `suspend`, `reactivate`, `delete`, `purge`)
+  - API call tracking by tenant and tier (`tenant_api_calls_total`)
+  - Dataset count gauge per tenant (`tenant_datasets_total`)
 
-**Note**: Stress tests were initially planned but removed due to API incompatibility with v0.4 architecture. Performance and load testing will be addressed in a future release with proper integration using Emitter and CatalogBackend APIs.
+- **Multi-Region Foundation (Phase 7B)**
+  - Schema migration v1.3.0 adding `region` column to `tenants` table
+  - Region field on `CreateTenantRequest` and `UpdateTenantRequest`
+  - Region-aware URI placeholder resolution (`{region}` in storage URI templates)
+  - `TenantBackendFactory::resolve_uri_with_region()` method
+  - End-to-end region propagation from database through API key validation to request pipeline
+
+#### Changed
+
+- `ValidatedTenantKey` now includes tenant region from control plane database
+- `CachedTenantKey` carries region for cache-aware lookups
+- `ResolvedTenant.region()` returns actual tenant region (was always `None`)
+- Cache invalidation now handles region-qualified keys (`tenant_id@region`)
+- API key validation SQL joins tenants table to fetch region during authentication
+
+#### Migration Notes
+
+- v1.3.0 migration is idempotent and backward-compatible
+- Existing tenants without region continue to work (region is nullable)
+- When region is NULL, default region from `METAFUSE_DEFAULT_REGION` environment variable is used
+- Storage URI templates support `{region}` placeholder: `gs://bucket/{region}/{tenant_id}/catalog.db`
+
+---
+
+## [0.7.0] - 2025-11-29
+
+### Governance & Delta Enhancement Release
+
+This release activates the PII classification engine, adds schema diff capabilities, and introduces full CRUD for domain management and business glossary.
+
+#### Added
+
+- **PII Classification Activated**
+  - `classification` feature now enabled by default
+  - `GET /api/v1/datasets/:name/classifications` - Get column classifications
+  - `POST /api/v1/datasets/:name/classifications` - Trigger manual scan
+  - `GET /api/v1/classifications/pii` - List all PII columns across catalog
+  - `PUT /api/v1/fields/:id/classification` - Manual classification override
+  - Auto-classification on dataset creation (opt-in via `METAFUSE_CLASSIFICATION_AUTO_SCAN=true`)
+  - Classification engine supports: EMAIL, PHONE, SSN, IP_ADDRESS, NAME, ADDRESS, DATE_OF_BIRTH
+
+- **Schema Diff Endpoint**
+  - `GET /api/v1/datasets/:name/schema/diff?from=X&to=Y` - Compare schema across Delta versions
+  - Returns added, removed, and modified columns between versions
+  - Leverages existing `DeltaReader::diff_schemas()` implementation
+
+- **Domain Management**
+  - New `domains` table (v1.1.0 migration)
+  - `GET /api/v1/domains` - List all domains with pagination
+  - `POST /api/v1/domains` - Create domain with name validation (slug format: `[a-z0-9_-]`)
+  - `GET /api/v1/domains/:name` - Get domain with dataset count
+  - `PUT /api/v1/domains/:name` - Update domain properties
+  - `DELETE /api/v1/domains/:name` - Soft delete (sets `is_active=0`)
+  - `GET /api/v1/domains/:name/datasets` - List datasets in domain
+  - Domains support `owner_id` for team ownership
+
+- **Glossary CRUD**
+  - `GET /api/v1/glossary` - List all glossary terms with pagination
+  - `POST /api/v1/glossary` - Create term with validation
+  - `GET /api/v1/glossary/:id` - Get term with link count
+  - `PUT /api/v1/glossary/:id` - Update term properties
+  - `DELETE /api/v1/glossary/:id` - Delete term (cascades to links)
+  - `GET /api/v1/glossary/:id/links` - Get term's dataset/field links
+  - `POST /api/v1/glossary/:id/links` - Link term to dataset or field
+  - `DELETE /api/v1/glossary/:id/links` - Unlink term
+  - Terms support status workflow: `draft` → `approved` → `deprecated`
+
+- **Schema Migration v1.1.0**
+  - New `domains` table with check constraints
+  - Added `domain_id` column to `datasets` table
+  - Enhanced `glossary_terms` with: `owner_id`, `status`, `created_at`, `updated_at`
+  - Indexes for common query patterns
+
+#### Changed
+
+- Default features now include `classification` (was: `audit`, `usage-analytics`)
+- All domain and glossary mutations emit audit events
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `METAFUSE_CLASSIFICATION_AUTO_SCAN` | `false` | Enable auto-classification on dataset creation |
+| `METAFUSE_SCHEMA_DIFF_MAX_VERSIONS` | `100` | Maximum version range for schema diff |
+
+---
+
+## [0.6.1] - 2025-11-29
+
+### Actor Enrichment for Audit Logging
+
+This patch release completes the audit context infrastructure promised in v0.6.0.
+
+#### Added
+
+- **AuditContext Middleware**
+  - Extracts API key identity from authenticated requests
+  - Extracts client IP from `X-Forwarded-For` or `X-Real-IP` headers
+  - Automatically injects `AuditContext` into all request handlers
+
+- **Actor Enrichment**
+  - All mutation handlers now enrich audit events with actor identity
+  - API key-authenticated requests logged with `ActorType::Service`
+  - Anonymous requests logged with `ActorType::Anonymous`
+  - Client IP included in audit events for traceability
+
+- **Tests**
+  - Unit tests for `AuditContext` struct and `enrich_event()` method
+  - Tests for `extract_client_ip()` function covering:
+    - X-Forwarded-For with multiple IPs (takes first)
+    - X-Real-IP header fallback
+    - Empty/missing header handling
+
+#### Changed
+
+- `AuditContext` is now always available (not feature-gated), enabling cleaner handler signatures
+- Middleware runs unconditionally to ensure `AuditContext` is present for all handlers
+
+#### Handlers Updated
+
+All 13 mutation handlers now include actor enrichment:
+
+- `create_dataset`, `update_dataset`, `delete_dataset`
+- `add_tags`, `remove_tags`
+- `create_owner`, `update_owner`, `delete_owner`
+- `create_lineage_edge`
+- `create_governance_rule`, `update_governance_rule`, `delete_governance_rule`
+- `set_freshness_config`
+
+---
+
+## [0.6.0] - 2025-11-29
+
+### Core Value Activation Release
+
+**Enterprise features activated** - This release activates dormant enterprise features that were already implemented but not wired to API handlers. Aligns with Lakehouse Catalog v2.0 Architecture.
+
+#### Added
+
+- **Quality Framework Activation**
+  - `GET /api/v1/datasets/:name/quality` - Compute/retrieve quality scores
+  - `GET /api/v1/quality/unhealthy?threshold=0.7` - List datasets below quality threshold
+  - Quality scores computed from Delta statistics (completeness, freshness, file health)
+  - `QualityCalculator` now fully wired to API handlers
+
+- **Usage Analytics Activation**
+  - `GET /api/v1/datasets/:name/usage` - Dataset usage statistics
+  - `GET /api/v1/analytics/popular?period=7d` - Most popular datasets
+  - `GET /api/v1/analytics/stale` - Detect stale/unused datasets
+  - `UsageTracker` with background flush task
+  - Automatic tracking on `get_dataset` and `search_datasets` handlers
+
+- **Audit Logging Expansion**
+  - Comprehensive audit coverage for all mutation handlers:
+    - Datasets: create, update, delete
+    - Tags: add, remove
+    - Owners: create, update, delete
+    - Lineage edges: create
+    - Governance rules: create, update, delete
+    - Freshness config: set
+  - `GET /api/v1/audit` endpoint with filters
+
+- **Feature Flag Updates**
+  - `audit` and `usage-analytics` enabled by default
+  - New `production` bundle: `enterprise + rate-limiting + api-keys + metrics`
+  - Zero-config activation for enterprise features
+
+#### Changed
+
+- Default features now include `audit` and `usage-analytics` for out-of-box enterprise functionality
+- All 70+ tests pass with new default features
+- **Breaking for users who relied on minimal default features**: If you need a minimal build without
+  enterprise features, use `--no-default-features` and enable only what you need
+
+#### Configuration
+
+Environment variables for tuning enterprise features:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `METAFUSE_AUDIT_BATCH_SIZE` | 100 | Max events per DB write batch |
+| `METAFUSE_AUDIT_FLUSH_INTERVAL_MS` | 5000 | Flush interval for audit queue |
+| `METAFUSE_USAGE_FLUSH_INTERVAL_MS` | 60000 | Flush interval for usage counters |
+
+#### Known Limitations
+
+- ~~Audit events include `request_id` for traceability but not yet full actor identity (API key/user).
+  `AuditContext` infrastructure is added; actor enrichment will be completed in v0.6.1.~~
+  **Resolved in v0.6.1** - Actor enrichment now complete with API key identity and client IP.
+
+#### Architecture
+
+v0.6.0 aligns with the Lakehouse Catalog v2.0 Architecture specification:
+
+- **Delta Delegation Pattern**: "Store what Delta doesn't know, delegate what Delta maintains"
+- **Enterprise Feature Activation**: Quality, Usage Analytics, Audit Logging all wired
+- **Multi-tenant Foundation**: Prepared for v0.8.0 physical tenant isolation
+
+---
+
+### v0.5.0 - CI Enhancement & Cloud Testing
+
+**No breaking changes** - this release focuses on CI infrastructure and testing improvements.
+
+#### Added
+
+- **Cloud Emulator Tests in CI**
+  - S3 tests with MinIO emulator (fully functional)
+  - GCS tests with fake-gcs-server (compile-validation only)
+  - Gated behind `RUN_CLOUD_TESTS=1` environment variable
+  - Only runs on main repository (not forks due to Docker limitations)
+  - Test isolation with unique object keys per test
+
+- **GCS Backend Emulator Support**
+  - `GcsBackend::new()` auto-detects `STORAGE_EMULATOR_HOST` environment variable
+  - Configures `gcs_base_url` and `disable_oauth` for local testing
+  - Enables testing without real GCP credentials
+
+#### Known Limitations
+
+- **GCS Emulator Tests Disabled**: GCS tests are marked `#[ignore]` due to XML API
+  incompatibility between `object_store` crate and `fake-gcs-server`:
+  - `object_store` uses XML API PUT for uploads (`PUT /<bucket>/<object>`)
+  - `fake-gcs-server` only supports JSON API for uploads
+  - Tracking: [fsouza/fake-gcs-server#331](https://github.com/fsouza/fake-gcs-server/issues/331)
+  - Tests will be re-enabled when fake-gcs-server adds XML API support
 
 #### Improved
 
-- CI safety: Docker availability checks, fork detection, timeouts
-- Documentation: Updated roadmap to reflect async completion
-- Test isolation: Emulator tests run in separate CI job
+- CI safety: Docker availability checks, fork detection, job timeouts
+- S3 test reliability: ETag-based concurrency detection, proper content modifications
+- Test isolation: Unique bucket/object keys per test run
+- Documentation: Removed outdated migration guides
 
-**Migration Guide**: [docs/MIGRATION-v0.5.md](docs/MIGRATION-v0.5.md)
+#### Removed
+
+- Duplicate migration files (consolidated to `docs/` directory)
 
 ---
 

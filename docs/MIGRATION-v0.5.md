@@ -6,16 +6,12 @@ This guide helps you upgrade from MetaFuse v0.4.x to v0.5.0.
 
 ## TL;DR
 
-**v0.5.0 removes deprecated synchronous APIs.** If you're already using v0.4.x async APIs, **no changes are required**.
-
-**Breaking changes:**
-- Removed `legacy-sync` feature flag
-- Removed `SyncBackendAdapter` module
+**Good news**: v0.5.0 has **no breaking changes**. All v0.4.x code continues to work unchanged.
 
 **Quick upgrade:**
 
 ```bash
-# If on v0.4.x with async/await (most users):
+# Update dependencies
 cargo update -p metafuse-catalog-api
 cargo update -p metafuse-catalog-storage
 cargo update -p metafuse-catalog-cli
@@ -29,306 +25,83 @@ cargo test
 
 ## What's New in v0.5.0
 
-### Production Hardening & Technical Debt Cleanup
+### CI Enhancement & Cloud Testing
 
-MetaFuse v0.5.0 focuses on production hardening following the v0.4.x async migration:
+MetaFuse v0.5.0 focuses on CI infrastructure improvements:
 
-- **Removed deprecated sync adapter** - Clean async-only API surface
-- **Enhanced CI validation** - Cloud emulator tests for GCS/S3 backends
-- **Security integration tests** - Rate limiting and API key authentication validation
-- **Cloud backend benchmarks** - Performance benchmarks for GCS/S3 (compile-only in CI)
-- **Improved documentation** - Updated guides and examples
+- **Cloud Emulator Tests**: S3 tests run against MinIO in CI
+- **GCS Emulator Support**: `GcsBackend` auto-detects `STORAGE_EMULATOR_HOST`
+- **Improved Test Isolation**: Unique object keys per test prevent conflicts
+- **CI Safety**: Docker checks, fork detection, job timeouts
 
-**No new features** - this is a cleanup release to remove technical debt.
+### No Breaking Changes
 
----
+v0.5.0 is fully backward compatible with v0.4.x. The upgrade path is:
 
-## Breaking Changes
-
-### 1. Removed `legacy-sync` Feature Flag
-
-**What changed:**
-- The `legacy-sync` Cargo feature has been removed
-- `SyncBackendAdapter` module has been removed
-- All code must use async/await APIs introduced in v0.4.0
-
-**Who is affected:**
-- Users still using `SyncBackendAdapter` from v0.3.x or earlier
-- Projects with `features = ["legacy-sync"]` in Cargo.toml
-
-**Migration path:**
-
-#### Before (v0.4.x with legacy-sync):
-
-```toml
-# Cargo.toml
-[dependencies]
-metafuse-catalog-storage = { version = "0.4.2", features = ["legacy-sync"] }
-```
-
-```rust
-use metafuse_catalog_storage::sync_adapter::SyncBackendAdapter;
-
-// Synchronous blocking calls
-let adapter = SyncBackendAdapter::new(backend)?;
-let download = adapter.download_blocking()?;
-adapter.upload_blocking(&download)?;
-```
-
-#### After (v0.5.0 with async/await):
-
-```toml
-# Cargo.toml
-[dependencies]
-metafuse-catalog-storage = { version = "0.5.0" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-```
-
-```rust
-// Use async/await directly
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let download = backend.download().await?;
-    backend.upload(&download).await?;
-    Ok(())
-}
-```
+1. Update dependencies
+2. Build and test
+3. Done!
 
 ---
 
-## Step-by-Step Migration
+## Cloud Emulator Testing
 
-### Step 1: Check Your Current Version
-
-Determine if you need to migrate:
+### Running S3 Tests Locally
 
 ```bash
-grep "metafuse-catalog" Cargo.toml
+# Start MinIO
+docker run -d --name minio \
+  -p 9000:9000 \
+  -e MINIO_ROOT_USER=minioadmin \
+  -e MINIO_ROOT_PASSWORD=minioadmin \
+  minio/minio:latest server /data
+
+# Create test bucket
+docker run --rm --network host \
+  --entrypoint /bin/sh minio/mc:latest \
+  -c "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && mc mb local/test-bucket"
+
+# Run S3 tests
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
 ```
 
-**Decision tree:**
-- **v0.4.x without `legacy-sync`**: ✅ No changes needed, just update
-- **v0.4.x with `legacy-sync`**: ⚠️ Follow migration steps below
-- **v0.3.x or earlier**: ⚠️ Migrate to v0.4.x first, then v0.5.0
+### GCS Tests (Currently Disabled)
 
-### Step 2: Remove `legacy-sync` Feature (If Present)
+GCS emulator tests are marked `#[ignore]` due to an incompatibility between
+the `object_store` crate and `fake-gcs-server`:
 
-**Update Cargo.toml:**
+- `object_store` uses XML API PUT for uploads
+- `fake-gcs-server` only supports JSON API uploads
+- Result: 405 Method Not Allowed errors
 
-```diff
-[dependencies]
-- metafuse-catalog-storage = { version = "0.4.2", features = ["legacy-sync"] }
-+ metafuse-catalog-storage = { version = "0.5.0" }
-```
+**Tracking Issues:**
+- [fake-gcs-server#331](https://github.com/fsouza/fake-gcs-server/issues/331)
+- [arrow-rs-object-store#167](https://github.com/apache/arrow-rs-object-store/issues/167)
 
-### Step 3: Convert Sync Code to Async
-
-**Pattern 1: Main function conversion**
-
-```diff
-- fn main() -> Result<(), Box<dyn std::error::Error>> {
--     let adapter = SyncBackendAdapter::new(backend)?;
--     let download = adapter.download_blocking()?;
--     Ok(())
-- }
-
-+ #[tokio::main]
-+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
-+     let download = backend.download().await?;
-+     Ok(())
-+ }
-```
-
-**Pattern 2: Existing async context**
-
-```diff
-async fn process_catalog(backend: Arc<dyn CatalogBackend>) -> Result<()> {
--     // Don't create sync adapter in async context!
--     let adapter = SyncBackendAdapter::new(backend.as_ref().clone())?;
--     let download = adapter.download_blocking()?;
-
-+     // Use async methods directly
-+     let download = backend.download().await?;
-    Ok(())
-}
-```
-
-**Pattern 3: Tests**
-
-```diff
-- #[test]
-- fn test_catalog_download() {
--     let adapter = SyncBackendAdapter::new(backend).unwrap();
--     let result = adapter.download_blocking();
--     assert!(result.is_ok());
-- }
-
-+ #[tokio::test]
-+ async fn test_catalog_download() {
-+     let result = backend.download().await;
-+     assert!(result.is_ok());
-+ }
-```
-
-### Step 4: Update Tokio Dependency (If Needed)
-
-Ensure you have Tokio in your Cargo.toml:
-
-```toml
-[dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-```
-
-### Step 5: Build and Test
-
-```bash
-# Clean build
-cargo clean
-cargo build
-
-# Run tests
-cargo test
-
-# If using cloud backends
-cargo test --features cloud
-
-# If using emulators (requires Docker)
-RUN_CLOUD_TESTS=1 cargo test --features cloud
-```
-
-### Step 6: Verify Migration
-
-**Checklist:**
-
-- [ ] No references to `SyncBackendAdapter` in your code
-- [ ] No `features = ["legacy-sync"]` in Cargo.toml
-- [ ] All catalog operations use `.await`
-- [ ] Main function or test functions use `#[tokio::main]` or `#[tokio::test]`
-- [ ] All tests pass
-- [ ] No deprecation warnings during build
+Tests will be re-enabled when fake-gcs-server adds XML API support.
 
 ---
 
-## Common Migration Patterns
+## Environment Variables
 
-### Pattern 1: CLI Applications
+### New in v0.5.0
 
-**Before:**
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RUN_CLOUD_TESTS` | Enable cloud emulator tests | `0` (disabled) |
 
-```rust
-use metafuse_catalog_storage::sync_adapter::SyncBackendAdapter;
+### Existing (unchanged)
 
-fn main() {
-    let backend = LocalSqliteBackend::new("catalog.db");
-    let adapter = SyncBackendAdapter::new(backend).unwrap();
-
-    let datasets = adapter.get_connection_blocking()
-        .unwrap()
-        .prepare("SELECT * FROM datasets")
-        // ...
-}
-```
-
-**After:**
-
-```rust
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LocalSqliteBackend::new("catalog.db");
-
-    let conn = backend.get_connection().await?;
-    let datasets = conn.prepare("SELECT * FROM datasets")?;
-    // ...
-    Ok(())
-}
-```
-
-### Pattern 2: Library Functions
-
-**Before:**
-
-```rust
-pub fn process_catalog(path: &str) -> Result<Vec<Dataset>> {
-    let backend = LocalSqliteBackend::new(path);
-    let adapter = SyncBackendAdapter::new(backend)?;
-    let conn = adapter.get_connection_blocking()?;
-    // ... query datasets
-}
-```
-
-**After:**
-
-```rust
-pub async fn process_catalog(path: &str) -> Result<Vec<Dataset>> {
-    let backend = LocalSqliteBackend::new(path);
-    let conn = backend.get_connection().await?;
-    // ... query datasets
-}
-```
-
-### Pattern 3: Background Tasks
-
-**Before:**
-
-```rust
-fn start_background_sync(backend: Arc<dyn CatalogBackend>) {
-    std::thread::spawn(move || {
-        let adapter = SyncBackendAdapter::new(backend.as_ref().clone()).unwrap();
-        loop {
-            adapter.download_blocking().unwrap();
-            std::thread::sleep(Duration::from_secs(60));
-        }
-    });
-}
-```
-
-**After:**
-
-```rust
-fn start_background_sync(backend: Arc<dyn CatalogBackend>) {
-    tokio::spawn(async move {
-        loop {
-            let _ = backend.download().await;
-            tokio::time::sleep(Duration::from_secs(60)).await;
-        }
-    });
-}
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `METAFUSE_CACHE_TTL_SECS` | Cache TTL in seconds | `60` |
+| `METAFUSE_CACHE_REVALIDATE` | Enable cache revalidation | `false` |
+| `STORAGE_EMULATOR_HOST` | GCS emulator endpoint | (none) |
+| `AWS_ENDPOINT` | S3-compatible endpoint | (none) |
 
 ---
 
-## Upgrading from v0.3.x or Earlier
-
-If you're on v0.3.x or earlier, you need a two-step upgrade:
-
-### Step 1: Upgrade to v0.4.2
-
-```bash
-cargo update -p metafuse-catalog-api
-cargo update -p metafuse-catalog-storage
-cargo build --features legacy-sync  # Use legacy adapter temporarily
-```
-
-See [MIGRATION-v0.4.md](MIGRATION-v0.4.md) for v0.3.x → v0.4.x upgrade guide.
-
-### Step 2: Migrate to Async
-
-Follow the migration patterns above to convert your code to async/await.
-
-### Step 3: Upgrade to v0.5.0
-
-Remove `legacy-sync` feature and upgrade:
-
-```bash
-cargo update -p metafuse-catalog-api
-cargo update -p metafuse-catalog-storage
-cargo build
-cargo test
-```
-
----
-
-## Testing Your Migration
+## Testing Your Upgrade
 
 ### Unit Tests
 
@@ -349,8 +122,8 @@ cargo test --features "rate-limiting,api-keys"
 # Cloud emulator tests (requires Docker)
 RUN_CLOUD_TESTS=1 cargo test --features cloud
 
-# Security integration tests
-cargo test --features rate-limiting,api-keys --test security_integration_tests
+# S3 tests only
+RUN_CLOUD_TESTS=1 cargo test --features s3 --test s3_emulator_tests
 ```
 
 ### Manual Testing
@@ -369,167 +142,15 @@ metafuse init --uri "s3://my-bucket/catalog.db?region=us-west-2"
 
 ---
 
-## Rollback Plan
-
-If you encounter issues:
-
-### Option 1: Stay on v0.4.2
-
-```toml
-[dependencies]
-metafuse-catalog-api = "0.4.2"
-metafuse-catalog-storage = { version = "0.4.2", features = ["legacy-sync"] }
-```
-
-```bash
-cargo update
-cargo build
-```
-
-### Option 2: Use Async APIs on v0.4.2
-
-v0.4.2 supports both sync adapter and async APIs. You can migrate incrementally:
-
-```toml
-[dependencies]
-metafuse-catalog-storage = "0.4.2"  # No legacy-sync feature
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
-```
-
-Test async migration on v0.4.2, then upgrade to v0.5.0 when ready.
-
----
-
-## Performance Considerations
-
-### Async is Faster
-
-The sync adapter had overhead from creating dedicated Tokio runtimes. Direct async/await is more efficient:
-
-**Before (sync adapter):**
-- Each operation created a runtime: ~1-2ms overhead
-- Blocked thread during I/O: inefficient for concurrent workloads
-
-**After (native async):**
-- Zero adapter overhead
-- Efficient I/O multiplexing with Tokio
-- Better throughput for concurrent operations
-
-### Benchmarks
-
-```bash
-# Run benchmarks to verify performance
-cargo bench --features bench
-
-# Expected improvements:
-# - Local SQLite: ~5-10% faster (reduced overhead)
-# - Cloud backends: ~20-30% faster (native async HTTP)
-# - Concurrent operations: ~50% faster (no thread blocking)
-```
-
----
-
-## Common Issues
-
-### Issue: "SyncBackendAdapter not found"
-
-**Symptom:**
-
-```
-error[E0432]: unresolved import `metafuse_catalog_storage::sync_adapter`
-```
-
-**Solution:**
-You're trying to use the removed sync adapter. Follow the migration patterns above to convert to async/await.
-
-### Issue: "Cannot use `await` outside async function"
-
-**Symptom:**
-
-```
-error[E0728]: `await` is only allowed inside `async` functions and blocks
-```
-
-**Solution:**
-Add `async` to your function signature and use `#[tokio::main]` or `#[tokio::test]`:
-
-```rust
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Your async code here
-    Ok(())
-}
-```
-
-### Issue: "No runtime available"
-
-**Symptom:**
-
-```
-thread 'main' panicked at 'there is no reactor running, must be called from the context of a Tokio runtime'
-```
-
-**Solution:**
-Ensure your `main` function uses `#[tokio::main]`:
-
-```rust
-#[tokio::main]
-async fn main() {
-    // ...
-}
-```
-
-### Issue: Tests fail with "runtime error"
-
-**Symptom:**
-
-```
-Cannot start a runtime from within a runtime
-```
-
-**Solution:**
-Use `#[tokio::test]` instead of `#[test]`:
-
-```diff
-- #[test]
-- fn test_download() {
-+ #[tokio::test]
-+ async fn test_download() {
-    let result = backend.download().await;
-    assert!(result.is_ok());
-}
-```
-
----
-
 ## Getting Help
 
-If you encounter migration issues:
+If you encounter issues:
 
 1. **Check documentation**: [docs/](.)
 2. **Search issues**: [GitHub Issues](https://github.com/ethan-tyler/MetaFuse/issues)
 3. **Ask the community**: [GitHub Discussions](https://github.com/ethan-tyler/MetaFuse/discussions)
-4. **Report bugs**: Use the [bug report template](.github/ISSUE_TEMPLATE/bug_report.yml)
 
 ---
 
-## Summary
-
-**Key Takeaways:**
-
-- ✅ v0.5.0 removes `legacy-sync` adapter (deprecated in v0.4.0)
-- ✅ All code must use async/await (already standard in v0.4.x)
-- ✅ If you're on v0.4.x async APIs, upgrade is trivial
-- ✅ Migration from sync is straightforward (add `async`/`.await`)
-- ✅ Performance improves with native async
-
-**Next Steps:**
-
-1. Review your codebase for `SyncBackendAdapter` usage
-2. Follow migration patterns to convert to async/await
-3. Test thoroughly before upgrading to v0.5.0
-4. Enjoy cleaner APIs and better performance!
-
----
-
-**Welcome to MetaFuse v0.5.0!** 🎉
+**Last Updated:** 2025-11-26
+**Applies To:** MetaFuse v0.5.0

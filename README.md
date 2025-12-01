@@ -75,10 +75,23 @@ MetaFuse supports multiple storage backends:
 
 #### Environment Variables
 
+**Storage:**
+
 - **`METAFUSE_CATALOG_URI`**: Override default catalog location
 - **`METAFUSE_CACHE_TTL_SECS`**: Cache TTL for cloud backends (default: 60, 0 to disable)
 - **`GOOGLE_APPLICATION_CREDENTIALS`**: Path to GCS service account JSON (GCS only)
 - **`AWS_ACCESS_KEY_ID`**, **`AWS_SECRET_ACCESS_KEY`**: AWS credentials (S3 only)
+
+**API Server:**
+
+- **`METAFUSE_PORT`**: API server port (default: 8080)
+- **`METAFUSE_RUN_MIGRATIONS`**: Set to `true` to auto-run migrations on startup
+
+**Enterprise Features (v0.6.0+):**
+
+- **`METAFUSE_AUDIT_BATCH_SIZE`**: Max events per audit DB write batch (default: 100)
+- **`METAFUSE_AUDIT_FLUSH_INTERVAL_MS`**: Audit flush interval in ms (default: 5000)
+- **`METAFUSE_USAGE_FLUSH_INTERVAL_MS`**: Usage counter flush interval in ms (default: 60000)
 
 #### Examples
 
@@ -169,6 +182,41 @@ metafuse search "analytics"
 # Statistics
 metafuse stats
 ```
+
+### Schema Migrations
+
+MetaFuse uses a versioned migration system to evolve the database schema. Migrations are forward-only and idempotent.
+
+```bash
+# Check migration status
+metafuse migrate status
+
+# Run pending migrations
+metafuse migrate run
+
+# View migration history
+metafuse migrate history
+```
+
+**Programmatic Usage:**
+
+```rust
+use metafuse_catalog_core::init_catalog;
+use rusqlite::Connection;
+
+let conn = Connection::open("catalog.db")?;
+
+// Initialize schema and run all migrations
+let migrations_applied = init_catalog(&conn, true)?;
+println!("Applied {} migrations", migrations_applied);
+```
+
+**Migration Notes:**
+
+- Migrations are tracked in `schema_migrations` table
+- Advisory locking prevents concurrent migrations
+- Version format: `MAJOR*1_000_000 + MINOR*1_000 + PATCH` (e.g., v1.0.0 = 1_000_000)
+- Rollbacks are not supported - plan migrations carefully
 
 ### Run the REST API
 

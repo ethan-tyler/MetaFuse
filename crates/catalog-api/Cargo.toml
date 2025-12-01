@@ -12,14 +12,26 @@ name = "metafuse-api"
 path = "src/main.rs"
 
 [features]
-default = []
+# Enterprise features enabled by default for v0.7.0
+default = ["audit", "usage-analytics", "classification"]
 metrics = ["prometheus", "lazy_static"]
 rate-limiting = ["dashmap"]
 api-keys = ["bcrypt", "rand", "dashmap", "hex"]
+# Phase 3: Enterprise Features
+audit = []
+usage-analytics = ["dashmap"]
+classification = ["regex"]
+# Enterprise bundle (all enterprise features)
+enterprise = ["audit", "usage-analytics", "classification"]
+# Production bundle (enterprise + security)
+production = ["enterprise", "rate-limiting", "api-keys", "metrics"]
+# Test utilities for integration tests
+test-utils = ["tempfile"]
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
 metafuse-catalog-storage = { path = "../catalog-storage" }
+metafuse-catalog-delta = { path = "../catalog-delta" }
 
 axum.workspace = true
 tokio.workspace = true
@@ -45,6 +57,12 @@ bcrypt = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 
+# Optional: Classification (Phase 3)
+regex = { workspace = true, optional = true }
+
+# Optional: Test utilities
+tempfile = { workspace = true, optional = true }
+
 [dev-dependencies]
-tempfile = { workspace = true }
 serial_test = "3.0"
+tempfile = { workspace = true }
