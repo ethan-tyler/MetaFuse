@@ -1,3 +1,7 @@
+// Allow dead_code for public API items used by library consumers
+// (multi-tenant building blocks, region support, backend wrappers)
+#![allow(dead_code)]
+
 //! Multi-Tenant Integration Layer
 //!
 //! This module provides the glue code for integrating multi-tenancy into the API server.

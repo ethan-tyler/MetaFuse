@@ -1,3 +1,7 @@
+// Allow dead_code for public API items that are used by library consumers
+// but not within the crate itself (control plane management APIs)
+#![allow(dead_code)]
+
 //! Control Plane for Multi-Tenant Management
 //!
 //! Provides tenant lifecycle management, tenant-scoped API keys, and audit logging

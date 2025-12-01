@@ -1,3 +1,7 @@
+// Allow dead_code for public API metrics functions that may not all be used
+// but are exposed for library consumers to integrate with their monitoring
+#![allow(dead_code)]
+
 //! Prometheus metrics for the MetaFuse catalog API
 //!
 //! This module is only compiled when the `metrics` feature is enabled.
