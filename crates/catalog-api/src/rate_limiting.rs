@@ -109,6 +109,8 @@ pub enum TenantTier {
 
 impl TenantTier {
     /// Parse tier from string.
+    /// Reserved for future use when parsing tier from external sources.
+    #[allow(dead_code)]
     pub fn parse_tier(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "free" => TenantTier::Free,
@@ -499,6 +501,17 @@ pub async fn rate_limit_middleware(
             Ok(response)
         }
         Err(retry_after) => {
+            // Record rate limit hit metric
+            #[cfg(feature = "metrics")]
+            {
+                let (tenant_id, tier) = req
+                    .extensions()
+                    .get::<crate::metrics::TenantMetricsInfo>()
+                    .map(|info| (info.tenant_id.as_str(), info.tier.as_str()))
+                    .unwrap_or(("unknown", "unknown"));
+                crate::metrics::record_tenant_rate_limit_hit(tenant_id, tier);
+            }
+
             let error_body = json!({
                 "error": {
                     "code": "RATE_LIMIT_EXCEEDED",

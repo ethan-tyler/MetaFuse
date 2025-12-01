@@ -35,7 +35,7 @@
 //! - Implementing tenant metric rotation for inactive tenants
 
 use axum::{
-    extract::{MatchedPath, Request},
+    extract::{Extension, MatchedPath, Request},
     http::StatusCode,
     middleware::Next,
     response::IntoResponse,
@@ -198,11 +198,171 @@ lazy_static! {
     .unwrap();
 }
 
-/// Tenant info extracted from request for metrics
+// =============================================================================
+// Cardinality Configuration
+// =============================================================================
+
+/// Configuration for tenant metrics cardinality control.
+///
+/// Controls whether per-tenant metrics include the actual `tenant_id` label
+/// or use an aggregated placeholder to prevent cardinality explosion.
+///
+/// # Cardinality Warning
+///
+/// Setting `include_tenant_id = true` will create a new Prometheus time series
+/// for each unique tenant. With many tenants (>1000), this can cause:
+/// - High memory usage in Prometheus
+/// - Slow metric queries
+/// - Storage bloat
+///
+/// Only enable per-tenant labels in environments with:
+/// - Small number of tenants
+/// - Appropriate metric retention policies
+/// - Sufficient Prometheus resources
+#[derive(Clone, Debug)]
+pub struct TenantMetricsConfig {
+    /// When true, include actual tenant_id in metric labels.
+    /// When false (default), use "aggregated" placeholder for cardinality safety.
+    pub include_tenant_id: bool,
+}
+
+impl Default for TenantMetricsConfig {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+impl TenantMetricsConfig {
+    /// Create configuration from environment variables.
+    ///
+    /// # Environment Variables
+    ///
+    /// - `METAFUSE_TENANT_METRICS_INCLUDE_ID`: Set to "true" to enable per-tenant labels.
+    ///   Default: "false" (tier-level aggregation only)
+    pub fn from_env() -> Self {
+        Self {
+            include_tenant_id: std::env::var("METAFUSE_TENANT_METRICS_INCLUDE_ID")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
+        }
+    }
+
+    /// Create configuration with per-tenant labels enabled.
+    ///
+    /// **Warning**: This can cause cardinality explosion with many tenants.
+    #[allow(dead_code)]
+    pub fn with_tenant_labels() -> Self {
+        Self {
+            include_tenant_id: true,
+        }
+    }
+
+    /// Create configuration with tier-level aggregation (no per-tenant labels).
+    #[allow(dead_code)]
+    pub fn aggregated() -> Self {
+        Self {
+            include_tenant_id: false,
+        }
+    }
+}
+
+// =============================================================================
+// Tenant Metrics Info
+// =============================================================================
+
+/// Tenant info extracted from request for metrics.
+///
+/// Used to label Prometheus metrics with tenant information.
+/// The actual tenant_id vs "aggregated" placeholder is controlled by
+/// `TenantMetricsConfig`.
 #[derive(Clone, Debug)]
 pub struct TenantMetricsInfo {
     pub tenant_id: String,
     pub tier: String,
+}
+
+impl TenantMetricsInfo {
+    /// Create tenant metrics info with cardinality-aware tenant_id.
+    ///
+    /// If `config.include_tenant_id` is false, uses "aggregated" placeholder
+    /// instead of the actual tenant_id to prevent metric cardinality explosion.
+    pub fn new(tenant_id: &str, tier: &str, config: &TenantMetricsConfig) -> Self {
+        Self {
+            tenant_id: if config.include_tenant_id {
+                tenant_id.to_string()
+            } else {
+                "aggregated".to_string()
+            },
+            tier: tier.to_string(),
+        }
+    }
+
+    /// Create tenant metrics info with explicit tenant_id (no cardinality control).
+    ///
+    /// Use this only when you need the actual tenant_id regardless of config.
+    #[allow(dead_code)]
+    pub fn with_explicit_tenant_id(tenant_id: &str, tier: &str) -> Self {
+        Self {
+            tenant_id: tenant_id.to_string(),
+            tier: tier.to_string(),
+        }
+    }
+}
+
+// =============================================================================
+// Tenant Metrics Injection Middleware
+// =============================================================================
+
+/// Middleware to inject `TenantMetricsInfo` into request extensions.
+///
+/// This middleware extracts tenant information from `ResolvedTenant` (if present)
+/// and creates `TenantMetricsInfo` for downstream metrics recording.
+///
+/// **Must run AFTER** `tenant_resolver_middleware` which populates `ResolvedTenant`.
+///
+/// # Cardinality Control
+///
+/// Uses `TenantMetricsConfig` to control whether the actual `tenant_id` or
+/// "aggregated" placeholder is used in metrics labels.
+///
+/// # Example
+///
+/// ```ignore
+/// // In main.rs middleware stack (layers execute in reverse order):
+/// app.layer(middleware::from_fn(track_metrics))
+///    .layer(middleware::from_fn(tenant_metrics_middleware))  // <-- This middleware
+///    .layer(middleware::from_fn(tenant_resolver_middleware))
+/// ```
+#[cfg(feature = "api-keys")]
+pub async fn tenant_metrics_middleware(
+    config: Option<Extension<TenantMetricsConfig>>,
+    mut req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    use crate::tenant_resolver::ResolvedTenant;
+
+    let metrics_config = config.map(|Extension(c)| c).unwrap_or_default();
+
+    // Extract tenant info from ResolvedTenant if present
+    if let Some(resolved) = req.extensions().get::<ResolvedTenant>() {
+        let tier_str = resolved
+            .tier()
+            .map(|t| format!("{:?}", t).to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let metrics_info = TenantMetricsInfo::new(resolved.tenant_id(), &tier_str, &metrics_config);
+
+        tracing::debug!(
+            tenant_id = %resolved.tenant_id(),
+            tier = %tier_str,
+            metrics_tenant_id = %metrics_info.tenant_id,
+            "Injected TenantMetricsInfo for metrics recording"
+        );
+
+        req.extensions_mut().insert(metrics_info);
+    }
+
+    next.run(req).await
 }
 
 /// Axum middleware to track HTTP request metrics

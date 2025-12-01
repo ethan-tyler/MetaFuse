@@ -53,13 +53,13 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 // Multi-tenant imports
-use multi_tenant::{MultiTenantConfig, MultiTenantResources, TenantBackend, resolve_backend};
+use multi_tenant::{resolve_backend, MultiTenantConfig, MultiTenantResources, TenantBackend};
 
 #[cfg(feature = "api-keys")]
-use multi_tenant::{require_write_permission, require_delete_permission};
+use multi_tenant::{require_delete_permission, require_write_permission};
 
 #[cfg(feature = "api-keys")]
-use tenant_resolver::{TenantResolverConfig, ResolvedTenant};
+use tenant_resolver::{ResolvedTenant, TenantResolverConfig};
 
 /// Request ID for tracking requests through the system
 #[derive(Debug, Clone)]
@@ -941,25 +941,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Add multi-tenant middleware if enabled (requires api-keys feature)
     #[cfg(feature = "api-keys")]
     let app = if mt_config.enabled {
-        use tenant_resolver::{tenant_resolver_middleware, require_tenant_middleware};
         use multi_tenant::tenant_backend_middleware;
+        use tenant_resolver::{require_tenant_middleware, tenant_resolver_middleware};
 
-        let factory = state.multi_tenant.factory().expect("factory required when enabled").clone();
-        let control_plane = state.multi_tenant.control_plane().expect("control plane required when enabled").clone();
+        let factory = state
+            .multi_tenant
+            .factory()
+            .expect("factory required when enabled")
+            .clone();
+        let control_plane = state
+            .multi_tenant
+            .control_plane()
+            .expect("control plane required when enabled")
+            .clone();
         let resolver_config = TenantResolverConfig::default();
 
         tracing::info!("Multi-tenant middleware enabled for API routes");
 
         // Middleware layers applied in reverse order (last added = first executed):
         // 1. tenant_resolver_middleware - Resolves tenant from API key or X-Tenant-ID header
-        // 2. require_tenant_middleware - Rejects requests without valid tenant context (401)
-        // 3. tenant_backend_middleware - Gets tenant-specific backend for resolved tenant
-        app.layer(middleware::from_fn(tenant_backend_middleware))
+        // 2. tenant_metrics_middleware - Injects TenantMetricsInfo for metrics recording (if enabled)
+        // 3. require_tenant_middleware - Rejects requests without valid tenant context (401)
+        // 4. tenant_backend_middleware - Gets tenant-specific backend for resolved tenant
+        #[cfg(feature = "metrics")]
+        let app = {
+            let metrics_config = metrics::TenantMetricsConfig::from_env();
+            tracing::info!(
+                include_tenant_id = metrics_config.include_tenant_id,
+                "Tenant metrics configured (cardinality control)"
+            );
+            app.layer(middleware::from_fn(tenant_backend_middleware))
+                .layer(middleware::from_fn(require_tenant_middleware))
+                .layer(middleware::from_fn(metrics::tenant_metrics_middleware))
+                .layer(middleware::from_fn(tenant_resolver_middleware))
+                .layer(Extension(factory))
+                .layer(Extension(control_plane))
+                .layer(Extension(resolver_config))
+                .layer(Extension(metrics_config))
+        };
+
+        #[cfg(not(feature = "metrics"))]
+        let app = app
+            .layer(middleware::from_fn(tenant_backend_middleware))
             .layer(middleware::from_fn(require_tenant_middleware))
             .layer(middleware::from_fn(tenant_resolver_middleware))
             .layer(Extension(factory))
             .layer(Extension(control_plane))
-            .layer(Extension(resolver_config))
+            .layer(Extension(resolver_config));
+
+        app
     } else {
         app
     };
@@ -1077,7 +1107,10 @@ async fn list_datasets(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         filter_tenant = ?params.get("tenant"),
@@ -1172,7 +1205,10 @@ async fn get_dataset(
     let includes =
         IncludeOptions::parse(&params.include).map_err(|e| bad_request(e, request_id.0.clone()))?;
 
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         dataset_name = %name,
@@ -1431,7 +1467,10 @@ async fn search_datasets(
         .get("q")
         .ok_or_else(|| bad_request("Missing 'q' parameter".to_string(), request_id.0.clone()))?;
 
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, search_query = %query, "Executing full-text search");
 
     // Validate FTS query (operators are allowed for powerful search)
@@ -1519,7 +1558,10 @@ async fn list_audit_logs(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<audit::AuditQueryParams>,
 ) -> Result<Json<audit::AuditLogResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         entity_type = ?params.entity_type,
@@ -1598,7 +1640,10 @@ async fn get_dataset_usage(
     Path(name): Path<String>,
     Query(params): Query<usage_analytics::UsageQueryParams>,
 ) -> Result<Json<usage_analytics::DatasetUsageResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         dataset_name = %name,
@@ -1662,7 +1707,10 @@ async fn get_popular_datasets(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<PopularQueryParams>,
 ) -> Result<Json<usage_analytics::PopularDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         limit = params.limit,
@@ -1704,7 +1752,10 @@ async fn get_stale_datasets(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<StaleQueryParams>,
 ) -> Result<Json<usage_analytics::StaleDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         threshold_days = params.threshold_days,
@@ -1758,7 +1809,10 @@ async fn get_dataset_quality(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<quality::QualityResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset_name = %name, "Getting dataset quality");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -1810,7 +1864,10 @@ async fn compute_dataset_quality(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<quality::QualityResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::info!(tenant_id = %tenant_id, dataset_name = %name, "Computing dataset quality");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -1897,7 +1954,10 @@ async fn get_unhealthy_datasets(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<UnhealthyQueryParams>,
 ) -> Result<Json<quality::UnhealthyDatasetsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, threshold = params.threshold, "Querying unhealthy datasets");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -1931,7 +1991,10 @@ async fn get_dataset_classifications(
     Path(name): Path<String>,
 ) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
 {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset_name = %name, "Getting dataset classifications");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -2007,7 +2070,10 @@ async fn scan_dataset_classifications(
     Path(name): Path<String>,
 ) -> Result<Json<classification::DatasetClassificationsResponse>, (StatusCode, Json<ErrorResponse>)>
 {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::info!(tenant_id = %tenant_id, dataset_name = %name, "Scanning dataset for classifications");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -2112,7 +2178,10 @@ async fn get_all_pii_columns(
     Extension(request_id): Extension<RequestId>,
     tenant_backend: Option<Extension<TenantBackend>>,
 ) -> Result<Json<classification::PiiColumnsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, "Getting all PII columns");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -2155,7 +2224,10 @@ async fn set_field_classification(
     Path(field_id): Path<i64>,
     Json(req): Json<classification::SetClassificationRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::info!(tenant_id = %tenant_id, field_id, classification = %req.classification, "Setting manual classification");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -2277,10 +2349,8 @@ async fn create_dataset(
 ) -> Result<(StatusCode, Json<DatasetResponse>), (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -2289,7 +2359,10 @@ async fn create_dataset(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %req.name, "Creating dataset");
 
@@ -2536,10 +2609,8 @@ async fn update_dataset(
 ) -> Result<Json<DatasetResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -2548,7 +2619,10 @@ async fn update_dataset(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %name, "Updating dataset");
 
@@ -2708,10 +2782,8 @@ async fn delete_dataset(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Check delete permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_delete_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -2720,7 +2792,10 @@ async fn delete_dataset(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %name, "Deleting dataset");
 
@@ -2785,10 +2860,8 @@ async fn add_tags(
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -2797,7 +2870,10 @@ async fn add_tags(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %name, tags = ?req.tags, "Adding tags to dataset");
 
@@ -2873,10 +2949,8 @@ async fn remove_tags(
 ) -> Result<Json<Vec<String>>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -2885,7 +2959,10 @@ async fn remove_tags(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %name, tags = ?req.tags, "Removing tags from dataset");
 
@@ -2964,10 +3041,8 @@ async fn create_owner(
 ) -> Result<(StatusCode, Json<OwnerResponse>), (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -2976,7 +3051,10 @@ async fn create_owner(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, owner_id = %req.owner_id, "Creating owner");
 
@@ -3057,7 +3135,10 @@ async fn list_owners(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<Vec<OwnerResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         limit = pagination.limit(),
@@ -3114,7 +3195,10 @@ async fn get_owner(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<String>,
 ) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, owner_id = %id, "Getting owner");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -3162,10 +3246,8 @@ async fn update_owner(
 ) -> Result<Json<OwnerResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -3174,7 +3256,10 @@ async fn update_owner(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, owner_id = %id, "Updating owner");
 
@@ -3286,10 +3371,8 @@ async fn delete_owner(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Check delete permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_delete_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -3298,7 +3381,10 @@ async fn delete_owner(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, owner_id = %id, "Deleting owner");
 
@@ -3347,7 +3433,10 @@ async fn list_domains(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<DomainResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, "Listing domains");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -3405,10 +3494,8 @@ async fn create_domain(
 ) -> Result<(StatusCode, Json<DomainResponse>), (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -3417,7 +3504,10 @@ async fn create_domain(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %req.name, "Creating domain");
 
@@ -3516,7 +3606,10 @@ async fn get_domain(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<DomainResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, name = %name, "Getting domain");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -3566,10 +3659,8 @@ async fn update_domain(
 ) -> Result<Json<DomainResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -3578,7 +3669,10 @@ async fn update_domain(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %name, "Updating domain");
 
@@ -3687,10 +3781,8 @@ async fn delete_domain(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Check delete permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_delete_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -3699,7 +3791,10 @@ async fn delete_domain(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %name, "Deleting domain");
 
@@ -3765,7 +3860,10 @@ async fn list_domain_datasets(
     Path(name): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<DatasetResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, domain = %name, "Listing datasets in domain");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -3851,7 +3949,10 @@ async fn list_glossary_terms(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<Vec<GlossaryTermResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, "Listing glossary terms");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -3913,10 +4014,8 @@ async fn create_glossary_term(
 ) -> Result<(StatusCode, Json<GlossaryTermResponse>), (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -3925,7 +4024,10 @@ async fn create_glossary_term(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, term = %req.term, "Creating glossary term");
 
@@ -4027,7 +4129,10 @@ async fn get_glossary_term(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<i64>,
 ) -> Result<Json<GlossaryTermResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, id, "Getting glossary term");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -4088,10 +4193,8 @@ async fn update_glossary_term(
 ) -> Result<Json<GlossaryTermResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -4100,7 +4203,10 @@ async fn update_glossary_term(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, id, "Updating glossary term");
 
@@ -4262,10 +4368,8 @@ async fn delete_glossary_term(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Check delete permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_delete_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -4274,7 +4378,10 @@ async fn delete_glossary_term(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, id, "Deleting glossary term");
 
@@ -4328,7 +4435,10 @@ async fn get_term_links(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<i64>,
 ) -> Result<Json<Vec<TermLinkResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, term_id = id, "Getting term links");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -4396,10 +4506,8 @@ async fn link_term(
 ) -> Result<(StatusCode, Json<TermLinkResponse>), (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -4408,7 +4516,10 @@ async fn link_term(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, term_id = id, ?req.dataset_id, ?req.field_id, "Linking term");
 
@@ -4546,10 +4657,8 @@ async fn unlink_term(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Check delete permission in multi-tenant mode (unlinking is a delete-style operation)
     #[cfg(feature = "api-keys")]
-    require_delete_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -4558,7 +4667,10 @@ async fn unlink_term(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, term_id = id, ?req.dataset_id, ?req.field_id, "Unlinking term");
 
@@ -4655,7 +4767,10 @@ async fn create_lineage_edge(
     tenant_backend: Option<Extension<TenantBackend>>,
     Json(req): Json<CreateLineageEdgeRequest>,
 ) -> Result<(StatusCode, Json<LineageEdgeResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         source = %req.source_dataset,
@@ -4765,10 +4880,8 @@ async fn create_governance_rule(
 ) -> Result<(StatusCode, Json<GovernanceRuleResponse>), (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -4777,7 +4890,10 @@ async fn create_governance_rule(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, name = %req.name, "Creating governance rule");
 
@@ -4860,7 +4976,10 @@ async fn list_governance_rules(
     tenant_backend: Option<Extension<TenantBackend>>,
     Query(pagination): Query<PaginationParams>,
 ) -> Result<Json<Vec<GovernanceRuleResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         limit = pagination.limit(),
@@ -4917,7 +5036,10 @@ async fn get_governance_rule(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(id): Path<i64>,
 ) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, id = %id, "Getting governance rule");
 
     let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
@@ -4970,10 +5092,8 @@ async fn update_governance_rule(
 ) -> Result<Json<GovernanceRuleResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Check write permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_write_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_write_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -4982,7 +5102,10 @@ async fn update_governance_rule(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, id = %id, "Updating governance rule");
 
@@ -5104,10 +5227,8 @@ async fn delete_governance_rule(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     // Check delete permission in multi-tenant mode
     #[cfg(feature = "api-keys")]
-    require_delete_permission(
-        resolved_tenant.as_ref().map(|e| &e.0),
-        &request_id.0,
-    ).map_err(rbac_error)?;
+    require_delete_permission(resolved_tenant.as_ref().map(|e| &e.0), &request_id.0)
+        .map_err(rbac_error)?;
 
     #[cfg(feature = "api-keys")]
     let tenant_id = resolved_tenant
@@ -5116,7 +5237,10 @@ async fn delete_governance_rule(
         .or_else(|| tenant_backend.as_ref().map(|e| e.0.tenant_id()))
         .unwrap_or("default");
     #[cfg(not(feature = "api-keys"))]
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
 
     tracing::debug!(tenant_id = %tenant_id, id = %id, "Deleting governance rule");
 
@@ -5166,7 +5290,10 @@ async fn create_quality_metric(
     Path(name): Path<String>,
     Json(req): Json<CreateQualityMetricRequest>,
 ) -> Result<(StatusCode, Json<QualityMetricResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Creating quality metric");
 
     validation::validate_dataset_name(&name)
@@ -5256,7 +5383,10 @@ async fn list_quality_metrics(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<QualityMetricResponse>>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Listing quality metrics");
 
     validation::validate_dataset_name(&name)
@@ -5327,7 +5457,10 @@ async fn set_freshness_config(
     Path(name): Path<String>,
     Json(req): Json<SetFreshnessConfigRequest>,
 ) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Setting freshness config");
 
     validation::validate_dataset_name(&name)
@@ -5440,7 +5573,10 @@ async fn get_freshness_config(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<FreshnessConfigResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Getting freshness config");
 
     validation::validate_dataset_name(&name)
@@ -5508,7 +5644,10 @@ async fn get_dataset_schema(
     Path(name): Path<String>,
     Query(params): Query<SchemaQueryParams>,
 ) -> Result<Json<SchemaResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, version = ?params.version, "Getting dataset schema from Delta");
 
     validation::validate_dataset_name(&name)
@@ -5583,7 +5722,10 @@ async fn get_dataset_schema_diff(
     Path(name): Path<String>,
     Query(params): Query<SchemaDiffQueryParams>,
 ) -> Result<Json<SchemaDiffResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(
         tenant_id = %tenant_id,
         dataset = %name,
@@ -5706,7 +5848,10 @@ async fn get_dataset_stats(
     tenant_backend: Option<Extension<TenantBackend>>,
     Path(name): Path<String>,
 ) -> Result<Json<StatsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, "Getting dataset stats from Delta");
 
     validation::validate_dataset_name(&name)
@@ -5771,7 +5916,10 @@ async fn get_dataset_history(
     Path(name): Path<String>,
     Query(params): Query<HistoryQueryParams>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let tenant_id = tenant_backend.as_ref().map(|e| e.0.tenant_id()).unwrap_or("default");
+    let tenant_id = tenant_backend
+        .as_ref()
+        .map(|e| e.0.tenant_id())
+        .unwrap_or("default");
     tracing::debug!(tenant_id = %tenant_id, dataset = %name, limit = ?params.limit, "Getting dataset history from Delta");
 
     validation::validate_dataset_name(&name)

@@ -24,7 +24,11 @@ mod rbac_tests {
     use tower::ServiceExt;
 
     /// Helper to create a ResolvedTenant for testing
-    fn create_test_tenant(tenant_id: &str, role: TenantRole, source: TenantSource) -> ResolvedTenant {
+    fn create_test_tenant(
+        tenant_id: &str,
+        role: TenantRole,
+        source: TenantSource,
+    ) -> ResolvedTenant {
         ResolvedTenant::for_testing(tenant_id, Some(role), source)
     }
 
@@ -156,7 +160,10 @@ mod rbac_tests {
         assert!(tenant.can_read(), "Admin should be able to read");
         assert!(tenant.can_write(), "Admin should be able to write");
         assert!(tenant.can_delete(), "Admin should be able to delete");
-        assert!(tenant.can_manage_keys(), "Admin should be able to manage keys");
+        assert!(
+            tenant.can_manage_keys(),
+            "Admin should be able to manage keys"
+        );
     }
 
     #[test]
@@ -193,10 +200,7 @@ mod rbac_tests {
             .layer(middleware::from_fn(require_tenant_middleware));
 
         // Request without ResolvedTenant extension
-        let req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
 
         let response = app.clone().oneshot(req).await.unwrap();
 
@@ -229,10 +233,7 @@ mod rbac_tests {
 
         // Create request with ResolvedTenant extension
         let tenant = create_test_tenant("tenant-1", TenantRole::Viewer, TenantSource::ApiKey);
-        let mut req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         req.extensions_mut().insert(tenant);
 
         let response = app.clone().oneshot(req).await.unwrap();
@@ -344,7 +345,8 @@ mod rbac_tests {
     #[test]
     fn test_both_source_with_admin_has_full_permissions() {
         // Both source (API key + header) with Admin role has full permissions
-        let tenant = ResolvedTenant::for_testing("tenant-1", Some(TenantRole::Admin), TenantSource::Both);
+        let tenant =
+            ResolvedTenant::for_testing("tenant-1", Some(TenantRole::Admin), TenantSource::Both);
         assert!(tenant.can_read());
         assert!(tenant.can_write());
         assert!(tenant.can_delete());

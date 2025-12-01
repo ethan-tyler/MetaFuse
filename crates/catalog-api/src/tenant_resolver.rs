@@ -48,6 +48,8 @@
 //! ```
 
 use crate::control_plane::{ControlPlane, TenantRole, ValidatedTenantKey};
+#[cfg(feature = "rate-limiting")]
+use crate::rate_limiting::{TenantRateLimitInfo, TenantTier as RateLimitTier};
 use axum::{
     extract::{Extension, Request},
     http::StatusCode,
@@ -55,10 +57,32 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use metafuse_catalog_storage::TenantContext;
+use metafuse_catalog_storage::{TenantContext, TenantTier};
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::{debug, warn};
+
+/// Convert storage TenantTier to rate limiting TenantTier
+#[cfg(feature = "rate-limiting")]
+fn convert_to_rate_limit_tier(tier: TenantTier) -> RateLimitTier {
+    match tier {
+        TenantTier::Free => RateLimitTier::Free,
+        TenantTier::Standard => RateLimitTier::Standard,
+        TenantTier::Premium => RateLimitTier::Premium,
+        TenantTier::Enterprise => RateLimitTier::Enterprise,
+    }
+}
+
+/// Inject TenantRateLimitInfo into request extensions for rate limiting
+#[cfg(feature = "rate-limiting")]
+fn inject_rate_limit_info(req: &mut Request, tenant_id: &str, tier: TenantTier) {
+    let rate_limit_tier = convert_to_rate_limit_tier(tier);
+    let rate_limit_info = TenantRateLimitInfo {
+        tenant_id: tenant_id.to_string(),
+        tier: rate_limit_tier,
+    };
+    req.extensions_mut().insert(rate_limit_info);
+}
 
 /// Configuration for the tenant resolver middleware.
 ///
@@ -102,6 +126,10 @@ pub struct ResolvedTenant {
     context: TenantContext,
     /// Role from API key (or None if resolved via header)
     role: Option<TenantRole>,
+    /// Tier from API key validation (used for rate limiting)
+    tier: Option<TenantTier>,
+    /// Region for multi-region deployments
+    region: Option<String>,
     /// Source of resolution
     source: TenantSource,
 }
@@ -125,6 +153,8 @@ impl ResolvedTenant {
         Ok(Self {
             context,
             role: Some(key.role),
+            tier: Some(key.tier),
+            region: key.region.clone(),
             source: TenantSource::ApiKey,
         })
     }
@@ -135,7 +165,22 @@ impl ResolvedTenant {
             .map_err(|e| format!("Invalid tenant ID in header: {}", e))?;
         Ok(Self {
             context,
+            role: None,   // No role when resolved via header only
+            tier: None,   // No tier when resolved via header only (will use default limits)
+            region: None, // No region when resolved via header only
+            source: TenantSource::Header,
+        })
+    }
+
+    /// Create a new resolved tenant from header with tier lookup
+    pub fn from_header_with_tier(tenant_id: &str, tier: TenantTier) -> Result<Self, String> {
+        let context = TenantContext::new(tenant_id)
+            .map_err(|e| format!("Invalid tenant ID in header: {}", e))?;
+        Ok(Self {
+            context,
             role: None, // No role when resolved via header only
+            tier: Some(tier),
+            region: None, // No region when resolved via header only
             source: TenantSource::Header,
         })
     }
@@ -147,6 +192,8 @@ impl ResolvedTenant {
         Ok(Self {
             context,
             role: Some(key.role),
+            tier: Some(key.tier),
+            region: key.region.clone(),
             source: TenantSource::Both,
         })
     }
@@ -157,6 +204,25 @@ impl ResolvedTenant {
         Self {
             context: TenantContext::new(tenant_id).expect("Invalid tenant ID for testing"),
             role,
+            tier: None, // Tests can set tier via for_testing_with_tier if needed
+            region: None,
+            source,
+        }
+    }
+
+    /// Create a new resolved tenant for testing purposes with tier
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_testing_with_tier(
+        tenant_id: &str,
+        role: Option<TenantRole>,
+        tier: Option<TenantTier>,
+        source: TenantSource,
+    ) -> Self {
+        Self {
+            context: TenantContext::new(tenant_id).expect("Invalid tenant ID for testing"),
+            role,
+            tier,
+            region: None,
             source,
         }
     }
@@ -174,6 +240,11 @@ impl ResolvedTenant {
     /// Get the role (if resolved via API key)
     pub fn role(&self) -> Option<TenantRole> {
         self.role
+    }
+
+    /// Get the tier (if resolved via API key)
+    pub fn tier(&self) -> Option<TenantTier> {
+        self.tier
     }
 
     /// Get the effective role (defaults to Viewer if no API key)
@@ -204,6 +275,14 @@ impl ResolvedTenant {
     /// Check if user can manage API keys
     pub fn can_manage_keys(&self) -> bool {
         self.effective_role().can_manage_keys()
+    }
+
+    /// Get the tenant region for multi-region deployments.
+    ///
+    /// Returns the region from the tenant's record in the control plane database.
+    /// When None, the factory will use the default region from environment.
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
     }
 }
 
@@ -370,6 +449,13 @@ pub async fn tenant_resolver_middleware(
                                 source = "both",
                                 "Resolved tenant from API key + header"
                             );
+                            // Inject rate limit info for tenant-aware rate limiting
+                            #[cfg(feature = "rate-limiting")]
+                            inject_rate_limit_info(
+                                &mut req,
+                                &validated_key.tenant_id,
+                                validated_key.tier,
+                            );
                             req.extensions_mut().insert(resolved);
                         }
                         Err(e) => {
@@ -394,6 +480,13 @@ pub async fn tenant_resolver_middleware(
                                 role = %resolved.effective_role(),
                                 source = "api_key",
                                 "Resolved tenant from API key"
+                            );
+                            // Inject rate limit info for tenant-aware rate limiting
+                            #[cfg(feature = "rate-limiting")]
+                            inject_rate_limit_info(
+                                &mut req,
+                                &validated_key.tenant_id,
+                                validated_key.tier,
                             );
                             req.extensions_mut().insert(resolved);
                         }
@@ -504,6 +597,13 @@ pub async fn tenant_resolver_middleware(
                             tenant = %resolved.tenant_id(),
                             source = "header",
                             "Resolved tenant from header (read-only)"
+                        );
+                        // Inject rate limit info for tenant-aware rate limiting
+                        #[cfg(feature = "rate-limiting")]
+                        inject_rate_limit_info(
+                            &mut req,
+                            &tenant_id,
+                            tenant.tier_enum().unwrap_or_default(),
                         );
                         req.extensions_mut().insert(resolved);
                     }
@@ -756,6 +856,8 @@ mod tests {
         let admin = ResolvedTenant {
             context: TenantContext::new("test-tenant").unwrap(),
             role: Some(TenantRole::Admin),
+            tier: Some(TenantTier::Standard),
+            region: None,
             source: TenantSource::ApiKey,
         };
         assert!(admin.can_read());
@@ -767,6 +869,8 @@ mod tests {
         let editor = ResolvedTenant {
             context: TenantContext::new("test-tenant").unwrap(),
             role: Some(TenantRole::Editor),
+            tier: Some(TenantTier::Standard),
+            region: None,
             source: TenantSource::ApiKey,
         };
         assert!(editor.can_read());
@@ -778,6 +882,8 @@ mod tests {
         let viewer = ResolvedTenant {
             context: TenantContext::new("test-tenant").unwrap(),
             role: Some(TenantRole::Viewer),
+            tier: Some(TenantTier::Standard),
+            region: None,
             source: TenantSource::ApiKey,
         };
         assert!(viewer.can_read());
@@ -789,6 +895,8 @@ mod tests {
         let header_only = ResolvedTenant {
             context: TenantContext::new("test-tenant").unwrap(),
             role: None,
+            tier: None,
+            region: None,
             source: TenantSource::Header,
         };
         assert!(header_only.can_read());
@@ -802,6 +910,8 @@ mod tests {
         let tenant = ResolvedTenant {
             context: TenantContext::new("acme-corp").unwrap(),
             role: Some(TenantRole::Admin),
+            tier: Some(TenantTier::Standard),
+            region: None,
             source: TenantSource::ApiKey,
         };
         assert_eq!(format!("{}", tenant), "acme-corp(api_key)");
@@ -809,6 +919,8 @@ mod tests {
         let tenant = ResolvedTenant {
             context: TenantContext::new("acme-corp").unwrap(),
             role: None,
+            tier: None,
+            region: None,
             source: TenantSource::Header,
         };
         assert_eq!(format!("{}", tenant), "acme-corp(header)");
@@ -816,6 +928,8 @@ mod tests {
         let tenant = ResolvedTenant {
             context: TenantContext::new("acme-corp").unwrap(),
             role: Some(TenantRole::Editor),
+            tier: Some(TenantTier::Standard),
+            region: None,
             source: TenantSource::Both,
         };
         assert_eq!(format!("{}", tenant), "acme-corp(both)");
@@ -827,6 +941,8 @@ mod tests {
         let with_role = ResolvedTenant {
             context: TenantContext::new("test").unwrap(),
             role: Some(TenantRole::Admin),
+            tier: Some(TenantTier::Standard),
+            region: None,
             source: TenantSource::ApiKey,
         };
         assert_eq!(with_role.effective_role(), TenantRole::Admin);
@@ -835,6 +951,8 @@ mod tests {
         let without_role = ResolvedTenant {
             context: TenantContext::new("test").unwrap(),
             role: None,
+            tier: None,
+            region: None,
             source: TenantSource::Header,
         };
         assert_eq!(without_role.effective_role(), TenantRole::Viewer);
@@ -852,12 +970,15 @@ mod tests {
         let tenant = ResolvedTenant {
             context: TenantContext::new("my-tenant").unwrap(),
             role: Some(TenantRole::Editor),
+            tier: Some(TenantTier::Premium),
+            region: None,
             source: TenantSource::Both,
         };
 
         assert_eq!(tenant.tenant_id(), "my-tenant");
         assert_eq!(tenant.context().tenant_id(), "my-tenant");
         assert_eq!(tenant.role(), Some(TenantRole::Editor));
+        assert_eq!(tenant.tier(), Some(TenantTier::Premium));
         assert_eq!(tenant.source(), TenantSource::Both);
     }
 
@@ -870,11 +991,14 @@ mod tests {
             tenant_id: "valid-tenant".to_string(),
             name: "Test Key".to_string(),
             role: TenantRole::Admin,
+            tier: TenantTier::Premium,
+            region: None,
         };
 
         let resolved = ResolvedTenant::from_api_key(&key).unwrap();
         assert_eq!(resolved.tenant_id(), "valid-tenant");
         assert_eq!(resolved.role(), Some(TenantRole::Admin));
+        assert_eq!(resolved.tier(), Some(TenantTier::Premium));
         assert_eq!(resolved.source(), TenantSource::ApiKey);
     }
 
@@ -904,11 +1028,14 @@ mod tests {
             tenant_id: "both-tenant".to_string(),
             name: "Both Key".to_string(),
             role: TenantRole::Viewer,
+            tier: TenantTier::Free,
+            region: None,
         };
 
         let resolved = ResolvedTenant::from_both(&key).unwrap();
         assert_eq!(resolved.tenant_id(), "both-tenant");
         assert_eq!(resolved.role(), Some(TenantRole::Viewer));
+        assert_eq!(resolved.tier(), Some(TenantTier::Free));
         assert_eq!(resolved.source(), TenantSource::Both);
     }
 
@@ -950,4 +1077,129 @@ mod tests {
     // Note: Full middleware integration tests would require mocking the ControlPlane
     // and are better placed in integration tests. Here we test the core logic
     // that doesn't require async context.
+
+    #[test]
+    fn test_tier_from_api_key() {
+        use crate::control_plane::ValidatedTenantKey;
+
+        // Test all tier levels
+        let tiers = [
+            (TenantTier::Free, TenantTier::Free),
+            (TenantTier::Standard, TenantTier::Standard),
+            (TenantTier::Premium, TenantTier::Premium),
+            (TenantTier::Enterprise, TenantTier::Enterprise),
+        ];
+
+        for (input_tier, expected_tier) in tiers {
+            let key = ValidatedTenantKey {
+                key_hash: "hash".to_string(),
+                tenant_id: "tier-test".to_string(),
+                name: "Test Key".to_string(),
+                role: TenantRole::Admin,
+                tier: input_tier,
+                region: None,
+            };
+
+            let resolved = ResolvedTenant::from_api_key(&key).unwrap();
+            assert_eq!(
+                resolved.tier(),
+                Some(expected_tier),
+                "Tier should be {:?} but got {:?}",
+                expected_tier,
+                resolved.tier()
+            );
+        }
+    }
+
+    #[test]
+    fn test_tier_from_header_is_none() {
+        // Header-only resolution should not have tier set
+        let resolved = ResolvedTenant::from_header("header-tenant").unwrap();
+        assert_eq!(
+            resolved.tier(),
+            None,
+            "Header-only resolution should not have tier"
+        );
+    }
+
+    #[test]
+    fn test_for_testing_with_tier() {
+        // Test the for_testing_with_tier constructor
+        let tenant = ResolvedTenant::for_testing_with_tier(
+            "test-tenant",
+            Some(TenantRole::Editor),
+            Some(TenantTier::Premium),
+            TenantSource::ApiKey,
+        );
+
+        assert_eq!(tenant.tenant_id(), "test-tenant");
+        assert_eq!(tenant.role(), Some(TenantRole::Editor));
+        assert_eq!(tenant.tier(), Some(TenantTier::Premium));
+        assert_eq!(tenant.source(), TenantSource::ApiKey);
+    }
+
+    #[test]
+    fn test_region_propagation_from_api_key() {
+        use crate::control_plane::ValidatedTenantKey;
+
+        // Test that region is propagated from ValidatedTenantKey to ResolvedTenant
+        let key_with_region = ValidatedTenantKey {
+            key_hash: "hash".to_string(),
+            tenant_id: "regional-tenant".to_string(),
+            name: "Regional Key".to_string(),
+            role: TenantRole::Admin,
+            tier: TenantTier::Premium,
+            region: Some("us-east1".to_string()),
+        };
+
+        let resolved = ResolvedTenant::from_api_key(&key_with_region).unwrap();
+        assert_eq!(resolved.region(), Some("us-east1"));
+
+        // Test that None region is also properly propagated
+        let key_without_region = ValidatedTenantKey {
+            key_hash: "hash2".to_string(),
+            tenant_id: "no-region-tenant".to_string(),
+            name: "No Region Key".to_string(),
+            role: TenantRole::Viewer,
+            tier: TenantTier::Standard,
+            region: None,
+        };
+
+        let resolved = ResolvedTenant::from_api_key(&key_without_region).unwrap();
+        assert_eq!(resolved.region(), None);
+    }
+
+    #[test]
+    fn test_region_from_header_is_none() {
+        // Header-only resolution should not have region set
+        let resolved = ResolvedTenant::from_header("header-tenant").unwrap();
+        assert_eq!(
+            resolved.region(),
+            None,
+            "Header-only resolution should not have region"
+        );
+    }
+
+    #[cfg(feature = "rate-limiting")]
+    #[test]
+    fn test_tier_conversion_to_rate_limit_tier() {
+        // Test the tier conversion helper
+        use crate::rate_limiting::TenantTier as RateLimitTier;
+
+        let conversions = [
+            (TenantTier::Free, RateLimitTier::Free),
+            (TenantTier::Standard, RateLimitTier::Standard),
+            (TenantTier::Premium, RateLimitTier::Premium),
+            (TenantTier::Enterprise, RateLimitTier::Enterprise),
+        ];
+
+        for (storage_tier, expected_rate_tier) in conversions {
+            let converted = convert_to_rate_limit_tier(storage_tier);
+            assert_eq!(
+                converted, expected_rate_tier,
+                "Storage tier {:?} should convert to rate limit tier {:?}",
+                storage_tier, expected_rate_tier
+            );
+        }
+    }
 }

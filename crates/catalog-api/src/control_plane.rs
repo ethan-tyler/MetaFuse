@@ -152,6 +152,9 @@ pub struct Tenant {
     pub updated_at: String,
     pub suspended_at: Option<String>,
     pub deleted_at: Option<String>,
+    /// Region for multi-region deployments (e.g., "us-east1", "europe-west1").
+    /// When None, uses the default region from environment.
+    pub region: Option<String>,
 }
 
 impl Tenant {
@@ -187,6 +190,10 @@ pub struct CreateTenantRequest {
     pub quota_max_storage_bytes: Option<i64>,
     #[serde(default)]
     pub quota_max_api_calls_per_hour: Option<i64>,
+    /// Region for tenant data storage (e.g., "us-east1", "europe-west1").
+    /// When None, uses the default region from environment.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// Request to update an existing tenant.
@@ -198,6 +205,8 @@ pub struct UpdateTenantRequest {
     pub quota_max_datasets: Option<i64>,
     pub quota_max_storage_bytes: Option<i64>,
     pub quota_max_api_calls_per_hour: Option<i64>,
+    /// Region for tenant data storage (e.g., "us-east1", "europe-west1").
+    pub region: Option<String>,
 }
 
 /// Tenant API key metadata.
@@ -220,6 +229,9 @@ pub struct ValidatedTenantKey {
     pub tenant_id: String,
     pub name: String,
     pub role: TenantRole,
+    pub tier: TenantTier,
+    /// Region for multi-region deployments.
+    pub region: Option<String>,
 }
 
 /// Audit log entry for control plane operations.
@@ -250,6 +262,8 @@ struct CachedTenantKey {
     tenant_id: String,
     name: String,
     role: TenantRole,
+    tier: TenantTier,
+    region: Option<String>,
     cached_at: Instant,
 }
 
@@ -323,6 +337,12 @@ impl ControlPlane {
         self.storage_uri_template.replace("{tenant_id}", tenant_id)
     }
 
+    /// Get the default region from environment.
+    /// Returns None if METAFUSE_DEFAULT_REGION is not set.
+    pub fn get_default_region() -> Option<String> {
+        std::env::var("METAFUSE_DEFAULT_REGION").ok()
+    }
+
     // =========================================================================
     // Tenant CRUD Operations
     // =========================================================================
@@ -345,6 +365,8 @@ impl ControlPlane {
         let quota_max_datasets = req.quota_max_datasets.unwrap_or(10000);
         let quota_max_storage_bytes = req.quota_max_storage_bytes.unwrap_or(10737418240);
         let quota_max_api_calls_per_hour = req.quota_max_api_calls_per_hour.unwrap_or(10000);
+        // Use provided region or fall back to default from environment
+        let region = req.region.or_else(Self::get_default_region);
 
         // Validate tier
         if tier.parse::<TenantTier>().is_err() {
@@ -384,8 +406,8 @@ impl ControlPlane {
             conn.execute(
                 r#"
                 INSERT INTO tenants (tenant_id, display_name, storage_uri, tier, admin_email,
-                    quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour, region)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 "#,
                 rusqlite::params![
                     tenant_id,
@@ -395,7 +417,8 @@ impl ControlPlane {
                     admin_email,
                     quota_max_datasets,
                     quota_max_storage_bytes,
-                    quota_max_api_calls_per_hour
+                    quota_max_api_calls_per_hour,
+                    region
                 ],
             )?;
 
@@ -403,7 +426,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -423,6 +446,7 @@ impl ControlPlane {
                     updated_at: row.get(11)?,
                     suspended_at: row.get(12)?,
                     deleted_at: row.get(13)?,
+                    region: row.get(14)?,
                 })
             })?;
 
@@ -458,6 +482,10 @@ impl ControlPlane {
         )
         .await?;
 
+        // Record lifecycle metric
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_tenant_created();
+
         info!(tenant_id = %tenant.tenant_id, tier = %tenant.tier, "Created tenant");
         Ok((tenant, api_key))
     }
@@ -477,6 +505,8 @@ impl ControlPlane {
         let quota_max_datasets = req.quota_max_datasets.unwrap_or(10000);
         let quota_max_storage_bytes = req.quota_max_storage_bytes.unwrap_or(10737418240);
         let quota_max_api_calls_per_hour = req.quota_max_api_calls_per_hour.unwrap_or(10000);
+        // Use provided region or fall back to default from environment
+        let region = req.region.or_else(Self::get_default_region);
 
         // Validate tier
         if tier.parse::<TenantTier>().is_err() {
@@ -499,8 +529,8 @@ impl ControlPlane {
             conn.execute(
                 r#"
                 INSERT INTO tenants (tenant_id, display_name, storage_uri, tier, admin_email,
-                    quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour, region)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 "#,
                 rusqlite::params![
                     tenant_id,
@@ -510,7 +540,8 @@ impl ControlPlane {
                     admin_email,
                     quota_max_datasets,
                     quota_max_storage_bytes,
-                    quota_max_api_calls_per_hour
+                    quota_max_api_calls_per_hour,
+                    region
                 ],
             )?;
 
@@ -518,7 +549,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -538,6 +569,7 @@ impl ControlPlane {
                     updated_at: row.get(11)?,
                     suspended_at: row.get(12)?,
                     deleted_at: row.get(13)?,
+                    region: row.get(14)?,
                 })
             })?;
 
@@ -563,6 +595,10 @@ impl ControlPlane {
         )
         .await?;
 
+        // Record lifecycle metric
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_tenant_created();
+
         info!(tenant_id = %tenant.tenant_id, tier = %tenant.tier, "Created tenant");
         Ok(tenant)
     }
@@ -578,7 +614,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -599,6 +635,7 @@ impl ControlPlane {
                         updated_at: row.get(11)?,
                         suspended_at: row.get(12)?,
                         deleted_at: row.get(13)?,
+                        region: row.get(14)?,
                     })
                 })
                 .optional()?;
@@ -621,7 +658,7 @@ impl ControlPlane {
                 let mut stmt = conn.prepare(
                     "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                             quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                            admin_email, created_at, updated_at, suspended_at, deleted_at
+                            admin_email, created_at, updated_at, suspended_at, deleted_at, region
                      FROM tenants WHERE status = ?1 ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([status], |row| {
@@ -640,6 +677,7 @@ impl ControlPlane {
                         updated_at: row.get(11)?,
                         suspended_at: row.get(12)?,
                         deleted_at: row.get(13)?,
+                        region: row.get(14)?,
                     })
                 })?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -647,7 +685,7 @@ impl ControlPlane {
                 let mut stmt = conn.prepare(
                     "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                             quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                            admin_email, created_at, updated_at, suspended_at, deleted_at
+                            admin_email, created_at, updated_at, suspended_at, deleted_at, region
                      FROM tenants ORDER BY created_at DESC",
                 )?;
                 let rows = stmt.query_map([], |row| {
@@ -666,6 +704,7 @@ impl ControlPlane {
                         updated_at: row.get(11)?,
                         suspended_at: row.get(12)?,
                         deleted_at: row.get(13)?,
+                        region: row.get(14)?,
                     })
                 })?;
                 rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -699,6 +738,7 @@ impl ControlPlane {
 
         // Serialize request for audit before move
         let req_json = serde_json::to_string(&req).unwrap_or_default();
+        let tier_updated = req.tier.is_some();
 
         let tenant = tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path)?;
@@ -732,6 +772,10 @@ impl ControlPlane {
                 updates.push("quota_max_api_calls_per_hour = ?");
                 params.push(Box::new(quota));
             }
+            if let Some(region) = req.region {
+                updates.push("region = ?");
+                params.push(Box::new(region));
+            }
 
             if updates.is_empty() {
                 return Err(CatalogError::ValidationError(
@@ -761,7 +805,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -781,6 +825,7 @@ impl ControlPlane {
                     updated_at: row.get(11)?,
                     suspended_at: row.get(12)?,
                     deleted_at: row.get(13)?,
+                    region: row.get(14)?,
                 })
             })?;
 
@@ -788,6 +833,12 @@ impl ControlPlane {
         })
         .await
         .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
+
+        // If tier was updated, invalidate cached keys so new limits take effect immediately.
+        #[cfg(feature = "api-keys")]
+        if tier_updated {
+            self.invalidate_tenant_cache(tenant_id);
+        }
 
         // Audit log
         self.audit_log(
@@ -829,7 +880,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -849,6 +900,7 @@ impl ControlPlane {
                     updated_at: row.get(11)?,
                     suspended_at: row.get(12)?,
                     deleted_at: row.get(13)?,
+                    region: row.get(14)?,
                 })
             })?;
 
@@ -871,6 +923,10 @@ impl ControlPlane {
             audit.client_ip.as_deref(),
         )
         .await?;
+
+        // Record lifecycle metric
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_tenant_suspended();
 
         info!(tenant_id = %tenant_id, "Suspended tenant");
         Ok(tenant)
@@ -901,7 +957,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -921,6 +977,7 @@ impl ControlPlane {
                     updated_at: row.get(11)?,
                     suspended_at: row.get(12)?,
                     deleted_at: row.get(13)?,
+                    region: row.get(14)?,
                 })
             })?;
 
@@ -939,6 +996,10 @@ impl ControlPlane {
             audit.client_ip.as_deref(),
         )
         .await?;
+
+        // Record lifecycle metric
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_tenant_reactivated();
 
         info!(tenant_id = %tenant_id, "Reactivated tenant");
         Ok(tenant)
@@ -969,7 +1030,7 @@ impl ControlPlane {
             let mut stmt = conn.prepare(
                 "SELECT id, tenant_id, display_name, status, tier, storage_uri,
                         quota_max_datasets, quota_max_storage_bytes, quota_max_api_calls_per_hour,
-                        admin_email, created_at, updated_at, suspended_at, deleted_at
+                        admin_email, created_at, updated_at, suspended_at, deleted_at, region
                  FROM tenants WHERE tenant_id = ?1",
             )?;
 
@@ -989,6 +1050,7 @@ impl ControlPlane {
                     updated_at: row.get(11)?,
                     suspended_at: row.get(12)?,
                     deleted_at: row.get(13)?,
+                    region: row.get(14)?,
                 })
             })?;
 
@@ -1011,6 +1073,10 @@ impl ControlPlane {
             audit.client_ip.as_deref(),
         )
         .await?;
+
+        // Record lifecycle metric
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_tenant_deleted();
 
         warn!(tenant_id = %tenant_id, "Tenant marked for deletion");
         Ok(tenant)
@@ -1071,6 +1137,10 @@ impl ControlPlane {
             audit.client_ip.as_deref(),
         )
         .await?;
+
+        // Record lifecycle metric
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_tenant_purged();
 
         warn!(tenant_id = %tenant_id, "Tenant purged permanently");
         Ok(())
@@ -1148,6 +1218,8 @@ impl ControlPlane {
                     tenant_id: cached.tenant_id.clone(),
                     name: cached.name.clone(),
                     role: cached.role,
+                    tier: cached.tier,
+                    region: cached.region.clone(),
                 }));
             } else {
                 debug!("Tenant API key validation: cache expired");
@@ -1163,9 +1235,10 @@ impl ControlPlane {
             let conn = Connection::open(&db_path)?;
 
             // Get all valid (non-revoked, non-expired) keys for active tenants
+            // Include region for multi-region deployments
             let mut stmt = conn.prepare(
                 r#"
-                SELECT k.key_hash, k.tenant_id, k.name, k.role
+                SELECT k.key_hash, k.tenant_id, k.name, k.role, t.tier, t.region
                 FROM tenant_api_keys k
                 JOIN tenants t ON k.tenant_id = t.tenant_id
                 WHERE k.revoked_at IS NULL
@@ -1174,19 +1247,37 @@ impl ControlPlane {
                 "#,
             )?;
 
-            let keys: Vec<(String, String, String, String)> = stmt
+            let keys: Vec<(String, String, String, String, String, Option<String>)> = stmt
                 .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             // Verify against each hash
-            for (key_hash, tenant_id, name, role) in keys {
+            for (key_hash, tenant_id, name, role, tier_str, region) in keys {
                 if verify(&plaintext, &key_hash).unwrap_or(false) {
                     let role = role.parse::<TenantRole>().unwrap_or_default();
-                    return Ok::<Option<(String, String, String, TenantRole)>, CatalogError>(Some(
-                        (key_hash, tenant_id, name, role),
-                    ));
+                    let tier = tier_str.parse::<TenantTier>().unwrap_or_default();
+                    return Ok::<
+                        Option<(
+                            String,
+                            String,
+                            String,
+                            TenantRole,
+                            TenantTier,
+                            Option<String>,
+                        )>,
+                        CatalogError,
+                    >(Some((
+                        key_hash, tenant_id, name, role, tier, region,
+                    )));
                 }
             }
 
@@ -1195,7 +1286,7 @@ impl ControlPlane {
         .await
         .map_err(|e| CatalogError::Other(format!("Task join error: {}", e)))??;
 
-        if let Some((key_hash, tenant_id, name, role)) = result {
+        if let Some((key_hash, tenant_id, name, role, tier, region)) = result {
             // Cache the valid key
             self.key_cache.insert(
                 cache_key,
@@ -1204,18 +1295,22 @@ impl ControlPlane {
                     tenant_id: tenant_id.clone(),
                     name: name.clone(),
                     role,
+                    tier,
+                    region: region.clone(),
                     cached_at: Instant::now(),
                 },
             );
 
             self.mark_key_used(&key_hash);
 
-            debug!(tenant_id = %tenant_id, name = %name, "Tenant API key validated");
+            debug!(tenant_id = %tenant_id, name = %name, tier = ?tier, region = ?region, "Tenant API key validated");
             Ok(Some(ValidatedTenantKey {
                 key_hash,
                 tenant_id,
                 name,
                 role,
+                tier,
+                region,
             }))
         } else {
             warn!("Tenant API key validation failed");
@@ -1545,6 +1640,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "test".to_string(),
@@ -1566,6 +1662,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "test".to_string(),
@@ -1600,6 +1697,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "test".to_string(),
@@ -1699,6 +1797,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "platform-admin".to_string(),
@@ -1785,6 +1884,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "platform-admin".to_string(),
@@ -1842,6 +1942,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "platform-admin".to_string(),
@@ -1899,6 +2000,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext {
                     actor: "platform-admin".to_string(),
@@ -1973,6 +2075,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext::default(),
             )
@@ -1990,6 +2093,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext::default(),
             )
@@ -2031,6 +2135,7 @@ mod tests {
                     quota_max_datasets: None,
                     quota_max_storage_bytes: None,
                     quota_max_api_calls_per_hour: None,
+                    region: None,
                 },
                 AuditContext::default(),
             )
@@ -2039,28 +2144,30 @@ mod tests {
 
         // Create two additional keys
         let editor_key = cp
-            .create_tenant_api_key(
-                "multi-keys",
-                "editor".to_string(),
-                TenantRole::Editor,
-                None,
-            )
+            .create_tenant_api_key("multi-keys", "editor".to_string(), TenantRole::Editor, None)
             .await
             .unwrap();
         let viewer_key = cp
-            .create_tenant_api_key(
-                "multi-keys",
-                "viewer".to_string(),
-                TenantRole::Viewer,
-                None,
-            )
+            .create_tenant_api_key("multi-keys", "viewer".to_string(), TenantRole::Viewer, None)
             .await
             .unwrap();
 
         // Validate all keys work
-        assert!(cp.validate_tenant_api_key(&admin_key).await.unwrap().is_some());
-        assert!(cp.validate_tenant_api_key(&editor_key).await.unwrap().is_some());
-        assert!(cp.validate_tenant_api_key(&viewer_key).await.unwrap().is_some());
+        assert!(cp
+            .validate_tenant_api_key(&admin_key)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(cp
+            .validate_tenant_api_key(&editor_key)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(cp
+            .validate_tenant_api_key(&viewer_key)
+            .await
+            .unwrap()
+            .is_some());
 
         // List keys should include all three
         let keys = cp.list_tenant_api_keys("multi-keys").await.unwrap();

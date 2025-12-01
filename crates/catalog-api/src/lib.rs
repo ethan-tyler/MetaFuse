@@ -3,6 +3,9 @@
 //! This crate provides library components for the MetaFuse Catalog API server,
 //! including API key management, rate limiting, and enterprise features.
 
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
 #[cfg(feature = "api-keys")]
 pub mod api_keys;
 
@@ -31,3 +34,7 @@ pub mod tenant_resolver;
 
 // Multi-Tenant Integration Layer
 pub mod multi_tenant;
+
+// Test utilities (feature-gated)
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;

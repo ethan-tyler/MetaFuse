@@ -26,7 +26,7 @@ enterprise = ["audit", "usage-analytics", "classification"]
 # Production bundle (enterprise + security)
 production = ["enterprise", "rate-limiting", "api-keys", "metrics"]
 # Test utilities for integration tests
-test-utils = []
+test-utils = ["tempfile"]
 
 [dependencies]
 metafuse-catalog-core = { path = "../catalog-core" }
@@ -60,6 +60,8 @@ hex = { workspace = true, optional = true }
 # Optional: Classification (Phase 3)
 regex = { workspace = true, optional = true }
 
+# Optional: Test utilities
+tempfile = { workspace = true, optional = true }
+
 [dev-dependencies]
-tempfile = { workspace = true }
 serial_test = "3.0"

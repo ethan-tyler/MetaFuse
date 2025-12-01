@@ -65,6 +65,8 @@ pub struct MultiTenantConfig {
     /// traffic, this should be `false` to require API key authentication.
     ///
     /// Default: `false` (require API key for tenant resolution)
+    /// Reserved for main.rs integration in a future phase.
+    #[allow(dead_code)]
     pub allow_header_only_resolution: bool,
 }
 
@@ -139,14 +141,32 @@ impl MultiTenantConfig {
 pub struct TenantBackend {
     backend: Arc<dyn CatalogBackend>,
     tenant_id: String,
+    /// Region for multi-region deployments (e.g., "us-east1", "europe-west1").
+    region: Option<String>,
 }
 
 impl TenantBackend {
     /// Create a new tenant backend wrapper.
+    /// Reserved for direct instantiation in future multi-tenant handlers.
+    #[allow(dead_code)]
     pub fn new(backend: Arc<dyn CatalogBackend>, tenant_id: impl Into<String>) -> Self {
         Self {
             backend,
             tenant_id: tenant_id.into(),
+            region: None,
+        }
+    }
+
+    /// Create a new tenant backend wrapper with region.
+    pub fn with_region(
+        backend: Arc<dyn CatalogBackend>,
+        tenant_id: impl Into<String>,
+        region: Option<String>,
+    ) -> Self {
+        Self {
+            backend,
+            tenant_id: tenant_id.into(),
+            region,
         }
     }
 
@@ -158,6 +178,16 @@ impl TenantBackend {
         Self {
             backend: Arc::clone(handle.backend()),
             tenant_id: handle.tenant_id().to_string(),
+            region: None,
+        }
+    }
+
+    /// Create from a connection handle with region.
+    pub fn from_handle_with_region(handle: &TenantBackendHandle, region: Option<String>) -> Self {
+        Self {
+            backend: Arc::clone(handle.backend()),
+            tenant_id: handle.tenant_id().to_string(),
+            region,
         }
     }
 
@@ -171,7 +201,14 @@ impl TenantBackend {
         &self.tenant_id
     }
 
+    /// Get the region.
+    pub fn region(&self) -> Option<&str> {
+        self.region.as_deref()
+    }
+
     /// Get an owned Arc to the backend.
+    /// Reserved for consuming the wrapper in migration scenarios.
+    #[allow(dead_code)]
     pub fn into_backend(self) -> Arc<dyn CatalogBackend> {
         self.backend
     }
@@ -259,6 +296,8 @@ impl MultiTenantResources {
     /// or None to indicate the caller should use the default backend.
     ///
     /// The returned handle maintains a connection permit that is released when dropped.
+    /// Reserved for main.rs handler integration in a future phase.
+    #[allow(dead_code)]
     pub async fn get_tenant_backend(
         &self,
         tenant: &TenantContext,
@@ -279,6 +318,7 @@ impl MultiTenantResources {
         since = "0.5.0",
         note = "Use get_tenant_backend() which returns a connection-limited handle"
     )]
+    #[allow(dead_code)]
     pub async fn get_tenant_backend_unchecked(
         &self,
         tenant: &TenantContext,
@@ -300,6 +340,8 @@ impl MultiTenantResources {
     /// # Returns
     ///
     /// `true` if the tenant was in the cache and removed, `false` otherwise.
+    /// Reserved for tenant lifecycle management integration.
+    #[allow(dead_code)]
     pub fn invalidate_tenant_cache(&self, tenant_id: &str) -> bool {
         match &self.factory {
             Some(factory) => {
@@ -319,6 +361,8 @@ impl MultiTenantResources {
     /// Clear all cached tenant backends.
     ///
     /// Use during graceful shutdown or when needing to refresh all connections.
+    /// Reserved for graceful shutdown integration.
+    #[allow(dead_code)]
     pub fn clear_all_caches(&self) {
         if let Some(factory) = &self.factory {
             factory.clear();
@@ -327,6 +371,8 @@ impl MultiTenantResources {
     }
 
     /// Get cache statistics.
+    /// Reserved for /metrics endpoint integration.
+    #[allow(dead_code)]
     pub fn cache_stats(&self) -> Option<(usize, usize)> {
         self.factory
             .as_ref()
@@ -371,7 +417,9 @@ pub struct RbacErrorResponse {
 ///
 /// This ensures audit logs reflect the authenticated tenant identity, not just
 /// the storage handle. Falls back to "default" when running in single-tenant mode.
+/// Reserved for audit logging integration in handlers.
 #[cfg(feature = "api-keys")]
+#[allow(dead_code)]
 pub fn get_tenant_id_for_logging<'a>(
     resolved_tenant: Option<&'a ResolvedTenant>,
     tenant_backend: Option<&'a TenantBackend>,
@@ -386,7 +434,9 @@ pub fn get_tenant_id_for_logging<'a>(
 }
 
 /// Get the tenant ID for logging (non-api-keys feature version).
+/// Reserved for audit logging integration in handlers.
 #[cfg(not(feature = "api-keys"))]
+#[allow(dead_code)]
 pub fn get_tenant_id_for_logging<'a>(
     _resolved_tenant: Option<&'a ()>,
     tenant_backend: Option<&'a TenantBackend>,
@@ -457,7 +507,9 @@ pub fn require_delete_permission(
 /// - The ResolvedTenant has key management permission (Admin role)
 ///
 /// Returns Err with a 403 Forbidden response if permission is denied.
+/// Reserved for tenant API key management endpoints.
 #[cfg(feature = "api-keys")]
+#[allow(dead_code)]
 pub fn require_admin_permission(
     resolved_tenant: Option<&ResolvedTenant>,
     request_id: &str,
@@ -484,6 +536,7 @@ pub fn require_admin_permission(
 /// 3. Injects TenantBackend (for handler access) and TenantConnectionPermit (for permit lifetime)
 ///
 /// The connection permit is automatically released when the request completes.
+/// Supports multi-region deployments by passing the tenant's region to the factory.
 ///
 /// # Error Responses
 ///
@@ -502,10 +555,17 @@ pub async fn tenant_backend_middleware(
 ) -> axum::response::Response {
     // Check if tenant was resolved
     if let Some(resolved) = req.extensions().get::<ResolvedTenant>().cloned() {
-        // Get connection-limited backend handle
-        match factory.get_backend_handle(resolved.context()).await {
+        // Get tenant region for multi-region deployments
+        let region = resolved.region().map(String::from);
+
+        // Get connection-limited backend handle with region
+        match factory
+            .get_backend_handle_with_region(resolved.context(), region.as_deref())
+            .await
+        {
             Ok(handle) => {
-                let tenant_backend = TenantBackend::from_handle(&handle);
+                let tenant_backend =
+                    TenantBackend::from_handle_with_region(&handle, region.clone());
                 let permit = TenantConnectionPermit::new(handle);
 
                 // Insert both: TenantBackend for handler access, permit for lifetime
@@ -514,6 +574,7 @@ pub async fn tenant_backend_middleware(
 
                 tracing::debug!(
                     tenant_id = %resolved.tenant_id(),
+                    region = ?region,
                     "Injected tenant backend with connection permit"
                 );
             }
@@ -521,6 +582,7 @@ pub async fn tenant_backend_middleware(
                 let error_msg = e.to_string();
                 tracing::error!(
                     tenant_id = %resolved.tenant_id(),
+                    region = ?region,
                     error = %error_msg,
                     "Failed to get tenant backend"
                 );
