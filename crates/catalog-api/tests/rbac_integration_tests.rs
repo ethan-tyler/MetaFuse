@@ -4,8 +4,10 @@
 //! 1. Permission checks work correctly for different roles (Reader, Editor, Admin)
 //! 2. The require_tenant_middleware enforces tenant context
 //! 3. Write/delete operations are properly guarded
+//!
+//! Run with: `cargo test -p metafuse-catalog-api --features "api-keys,test-utils" --test rbac_integration_tests`
 
-#[cfg(feature = "api-keys")]
+#[cfg(all(feature = "api-keys", feature = "test-utils"))]
 mod rbac_tests {
     use axum::{
         body::Body,
@@ -355,9 +357,11 @@ mod rbac_tests {
 }
 
 // Feature gate message for tests
-#[cfg(not(feature = "api-keys"))]
+#[cfg(not(all(feature = "api-keys", feature = "test-utils")))]
 #[test]
 fn rbac_tests_require_api_keys_feature() {
-    eprintln!("RBAC integration tests require the 'api-keys' feature");
-    eprintln!("Run with: cargo test --features api-keys --test rbac_integration_tests");
+    eprintln!("RBAC integration tests require 'api-keys' and 'test-utils' features");
+    eprintln!(
+        "Run with: cargo test --features \"api-keys,test-utils\" --test rbac_integration_tests"
+    );
 }
