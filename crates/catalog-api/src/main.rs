@@ -238,6 +238,40 @@ struct AdminListTenantsQuery {
     status: Option<String>,
 }
 
+/// Response for tenant usage endpoint (admin view)
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Serialize)]
+struct TenantUsageResponse {
+    tenant_id: String,
+    /// Current dataset count
+    dataset_count: i64,
+    /// Quota limits
+    quota_max_datasets: i64,
+    quota_max_storage_bytes: i64,
+    quota_max_api_calls_per_hour: i64,
+    /// Usage percentages (0.0 to 1.0+)
+    usage_ratio_datasets: f64,
+    /// Human-readable status
+    status: String,
+}
+
+/// Response for tenant self-service usage endpoint
+#[cfg(feature = "api-keys")]
+#[derive(Debug, Serialize)]
+struct MyUsageResponse {
+    /// Current dataset count
+    dataset_count: i64,
+    /// Quota limit for datasets (0 = unlimited)
+    quota_max_datasets: i64,
+    /// Usage percentage (0.0 to 1.0+)
+    usage_ratio: f64,
+    /// Human-readable status: "ok", "warning", "exceeded", "unlimited"
+    status: String,
+    /// Optional warning message when approaching or exceeding quota
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
 // =============================================================================
 // Admin Auth Middleware
 // =============================================================================
@@ -1005,6 +1039,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/v1/quality/unhealthy", get(get_unhealthy_datasets));
 
+    // Tenant self-service usage endpoint (requires api-keys for auth)
+    #[cfg(feature = "api-keys")]
+    let app = app.route("/api/v1/usage", get(get_my_usage));
+
     // Classification endpoints if classification feature is enabled
     #[cfg(feature = "classification")]
     let app = app
@@ -1089,6 +1127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 delete(admin_revoke_api_key),
             )
             .route("/audit-log", get(admin_get_audit_log))
+            .route("/tenants/:tenant_id/usage", get(admin_get_tenant_usage))
             .layer(middleware::from_fn(require_admin_auth));
 
         tracing::info!("Admin API routes enabled at /api/v1/admin/*");
@@ -1593,6 +1632,199 @@ async fn admin_get_audit_log(
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
     Ok(Json(logs))
+}
+
+/// Get usage statistics for a tenant (admin endpoint)
+#[cfg(feature = "api-keys")]
+async fn admin_get_tenant_usage(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<TenantUsageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    // Get tenant info
+    let tenant = control_plane
+        .get_tenant(&tenant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Tenant '{}' not found", tenant_id),
+                    request_id: request_id.0.clone(),
+                }),
+            )
+        })?;
+
+    // Get tenant's backend to count datasets
+    let factory = state.multi_tenant.factory().ok_or_else(|| {
+        internal_error(
+            "Tenant factory not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let backend = factory
+        .get_backend_by_id(&tenant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Count datasets
+    let dataset_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Calculate usage ratio
+    let usage_ratio_datasets = if tenant.quota_max_datasets > 0 {
+        dataset_count as f64 / tenant.quota_max_datasets as f64
+    } else {
+        0.0 // Unlimited quota
+    };
+
+    // Determine status
+    let status = if tenant.quota_max_datasets <= 0 {
+        "unlimited".to_string()
+    } else if usage_ratio_datasets >= 1.0 {
+        "exceeded".to_string()
+    } else if usage_ratio_datasets >= 0.8 {
+        "warning".to_string()
+    } else {
+        "ok".to_string()
+    };
+
+    tracing::info!(
+        tenant_id = %tenant_id,
+        dataset_count,
+        quota_max = tenant.quota_max_datasets,
+        usage_ratio = usage_ratio_datasets,
+        "Returning tenant usage stats"
+    );
+
+    Ok(Json(TenantUsageResponse {
+        tenant_id,
+        dataset_count,
+        quota_max_datasets: tenant.quota_max_datasets,
+        quota_max_storage_bytes: tenant.quota_max_storage_bytes,
+        quota_max_api_calls_per_hour: tenant.quota_max_api_calls_per_hour,
+        usage_ratio_datasets,
+        status,
+    }))
+}
+
+/// Get my usage statistics (tenant self-service endpoint)
+///
+/// Returns the authenticated tenant's current usage and quota status.
+#[cfg(feature = "api-keys")]
+async fn get_my_usage(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    resolved_tenant: Option<Extension<ResolvedTenant>>,
+    tenant_backend: Option<Extension<TenantBackend>>,
+) -> Result<Json<MyUsageResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Require tenant authentication
+    let resolved = resolved_tenant.as_ref().map(|e| &e.0).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Authentication required to view usage".to_string(),
+                request_id: request_id.0.clone(),
+            }),
+        )
+    })?;
+
+    let tenant_id = resolved.tenant_id();
+
+    // Get control plane to fetch quota info
+    let control_plane = state.multi_tenant.control_plane().ok_or_else(|| {
+        internal_error(
+            "Control plane not available".to_string(),
+            request_id.0.clone(),
+        )
+    })?;
+
+    let tenant = control_plane
+        .get_tenant(tenant_id)
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?
+        .ok_or_else(|| {
+            internal_error(
+                format!("Tenant '{}' not found in control plane", tenant_id),
+                request_id.0.clone(),
+            )
+        })?;
+
+    // Get backend to count datasets
+    let backend = resolve_backend(&state.backend, tenant_backend.as_ref().map(|e| &e.0));
+    let conn = backend
+        .get_connection()
+        .await
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Count datasets
+    let dataset_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))
+        .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    let quota_max = tenant.quota_max_datasets;
+
+    // Calculate usage ratio and determine status
+    let (usage_ratio, status, warning) = if quota_max <= 0 {
+        (0.0, "unlimited".to_string(), None)
+    } else {
+        let ratio = dataset_count as f64 / quota_max as f64;
+        if ratio >= 1.0 {
+            (
+                ratio,
+                "exceeded".to_string(),
+                Some(format!(
+                    "Dataset quota exceeded: {} of {} datasets used",
+                    dataset_count, quota_max
+                )),
+            )
+        } else if ratio >= 0.8 {
+            (
+                ratio,
+                "warning".to_string(),
+                Some(format!(
+                    "Approaching dataset quota: {} of {} ({:.0}%)",
+                    dataset_count,
+                    quota_max,
+                    ratio * 100.0
+                )),
+            )
+        } else {
+            (ratio, "ok".to_string(), None)
+        }
+    };
+
+    tracing::debug!(
+        tenant_id = %tenant_id,
+        dataset_count,
+        quota_max,
+        usage_ratio,
+        status = %status,
+        "Returning tenant usage"
+    );
+
+    Ok(Json(MyUsageResponse {
+        dataset_count,
+        quota_max_datasets: quota_max,
+        usage_ratio,
+        status,
+        warning,
+    }))
 }
 
 // =============================================================================
@@ -2828,6 +3060,121 @@ fn bad_request(message: String, request_id: String) -> (StatusCode, Json<ErrorRe
     )
 }
 
+/// Helper function to create quota exceeded error response (HTTP 403)
+#[cfg(feature = "quota-enforcement")]
+fn quota_exceeded(message: String, request_id: String) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::warn!(message = %message, "Quota exceeded");
+    (
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse {
+            error: message,
+            request_id,
+        }),
+    )
+}
+
+/// Result of quota check including soft limit warning state
+#[cfg(feature = "quota-enforcement")]
+struct QuotaCheckResult {
+    /// Whether a soft limit warning should be returned
+    warning: Option<String>,
+}
+
+/// Check dataset quota for a tenant.
+///
+/// Returns Ok(QuotaCheckResult) if the tenant is within their quota (or in dry-run mode).
+/// Returns Err with 403 if quota is exceeded and enforcement is enabled.
+///
+/// # Dry-run mode
+///
+/// When METAFUSE_QUOTA_DRY_RUN=true (default), quota violations are logged but not enforced.
+/// This allows safe production rollout with metering before enforcement.
+#[cfg(feature = "quota-enforcement")]
+fn check_dataset_quota(
+    conn: &rusqlite::Connection,
+    tenant: &control_plane::Tenant,
+    request_id: &str,
+) -> Result<QuotaCheckResult, (StatusCode, Json<ErrorResponse>)> {
+    let quota_max = tenant.quota_max_datasets;
+    let tenant_id = &tenant.tenant_id;
+
+    // Unlimited quota (0 or negative means no limit)
+    if quota_max <= 0 {
+        #[cfg(feature = "metrics")]
+        metrics::record_quota_check_ok(tenant_id, "datasets");
+        return Ok(QuotaCheckResult { warning: None });
+    }
+
+    // Count current datasets
+    let current_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM datasets", [], |row| row.get(0))
+        .map_err(|e| internal_error(e.to_string(), request_id.to_string()))?;
+
+    let dry_run = std::env::var("METAFUSE_QUOTA_DRY_RUN")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true); // Default to dry-run mode for safe rollout
+
+    // Calculate usage ratio for metrics and soft limit warning
+    let usage_ratio = current_count as f64 / quota_max as f64;
+    let usage_percent = usage_ratio * 100.0;
+    let soft_limit_threshold = 80.0;
+
+    // Update quota usage ratio metric
+    #[cfg(feature = "metrics")]
+    metrics::update_quota_usage_ratio(tenant_id, "datasets", usage_ratio);
+
+    // Check if at hard limit
+    if current_count >= quota_max {
+        let msg = format!(
+            "Dataset quota exceeded: {} of {} datasets used",
+            current_count, quota_max
+        );
+
+        #[cfg(feature = "metrics")]
+        metrics::record_quota_exceeded(tenant_id, "datasets");
+
+        if dry_run {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                current = current_count,
+                quota = quota_max,
+                "Quota exceeded (dry-run mode - not enforced)"
+            );
+
+            #[cfg(feature = "metrics")]
+            metrics::record_quota_dry_run_allowed(tenant_id, "datasets");
+
+            // In dry-run mode, return warning but allow operation
+            return Ok(QuotaCheckResult {
+                warning: Some(format!("Quota exceeded (dry-run): {}", msg)),
+            });
+        }
+
+        #[cfg(feature = "metrics")]
+        metrics::record_quota_blocked(tenant_id, "datasets");
+
+        return Err(quota_exceeded(msg, request_id.to_string()));
+    }
+
+    // Soft limit warning at 80%
+    let warning = if usage_percent >= soft_limit_threshold {
+        #[cfg(feature = "metrics")]
+        metrics::record_quota_warning(tenant_id, "datasets");
+
+        Some(format!(
+            "Approaching dataset quota: {} of {} ({:.0}%)",
+            current_count, quota_max, usage_percent
+        ))
+    } else {
+        #[cfg(feature = "metrics")]
+        metrics::record_quota_check_ok(tenant_id, "datasets");
+
+        None
+    };
+
+    Ok(QuotaCheckResult { warning })
+}
+
 fn parse_partition_keys(raw: Option<String>) -> Vec<String> {
     raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
         .unwrap_or_default()
@@ -2874,6 +3221,31 @@ async fn create_dataset(
         .get_connection()
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
+
+    // Check dataset quota before creation
+    #[cfg(feature = "quota-enforcement")]
+    let _quota_warning = {
+        // Get tenant from control plane to check quota
+        if let Some(control_plane) = state.multi_tenant.control_plane() {
+            if let Ok(Some(tenant)) = control_plane.get_tenant(tenant_id).await {
+                let result = check_dataset_quota(&conn, &tenant, &request_id.0)?;
+                if let Some(ref warning) = result.warning {
+                    tracing::info!(
+                        tenant_id = %tenant_id,
+                        warning = %warning,
+                        "Quota warning for dataset creation"
+                    );
+                }
+                result.warning
+            } else {
+                tracing::debug!(tenant_id = %tenant_id, "Tenant not found in control plane, skipping quota check");
+                None
+            }
+        } else {
+            tracing::debug!("Control plane not configured, skipping quota check");
+            None
+        }
+    };
 
     // Check if dataset already exists
     let exists: bool = conn

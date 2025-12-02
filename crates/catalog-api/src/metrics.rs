@@ -29,11 +29,26 @@
 //! - `tenant_circuit_breaker_state` - Gauge for circuit breaker state (0=closed, 1=open)
 //! - `tenant_circuit_breaker_trips_total` - Counter for circuit breaker trips
 //!
-//! ## Cardinality Warning
+//! ## Quota Enforcement Metrics
+//!
+//! - `tenant_quota_checks_total` - Counter for quota checks by result (ok, exceeded, warning)
+//! - `tenant_quota_usage_ratio` - Gauge for current quota usage ratio per tenant/resource
+//! - `tenant_quota_enforcement_total` - Counter for enforcement actions (blocked, dry_run_allowed)
+//!
+//! ## Cardinality Control
 //!
 //! Per-tenant metrics (those with `tenant_id` label) create a new Prometheus time series
 //! for each unique tenant. In deployments with a large number of tenants (>1000), this
-//! can lead to high memory usage and slow metric queries. Consider:
+//! can lead to high memory usage and slow metric queries.
+//!
+//! By default, quota metrics use "aggregated" as the tenant_id label to prevent
+//! cardinality explosion. To enable per-tenant quota metrics, set:
+//!
+//! ```bash
+//! export METAFUSE_TENANT_METRICS_INCLUDE_ID=true
+//! ```
+//!
+//! Additional strategies:
 //! - Aggregating metrics at the tier level instead of tenant level
 //! - Using metric relabeling to drop high-cardinality labels
 //! - Implementing tenant metric rotation for inactive tenants
@@ -198,6 +213,34 @@ lazy_static! {
         "tenant_circuit_breaker_trips_total",
         "Total circuit breaker trips per tenant",
         &["tenant_id"]
+    )
+    .unwrap();
+
+    // ==========================================================================
+    // Quota Enforcement Metrics
+    // ==========================================================================
+
+    /// Counter for quota checks per tenant and result
+    pub static ref TENANT_QUOTA_CHECKS_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_quota_checks_total",
+        "Total quota checks by result (ok, exceeded, warning)",
+        &["tenant_id", "resource_type", "result"]  // result: "ok", "exceeded", "warning"
+    )
+    .unwrap();
+
+    /// Gauge for quota usage percentage per tenant and resource type
+    pub static ref TENANT_QUOTA_USAGE_RATIO: GaugeVec = register_gauge_vec!(
+        "tenant_quota_usage_ratio",
+        "Current quota usage ratio (0.0 to 1.0+) per tenant and resource type",
+        &["tenant_id", "resource_type"]  // resource_type: "datasets", "storage_bytes", "api_calls"
+    )
+    .unwrap();
+
+    /// Counter for quota enforcement actions
+    pub static ref TENANT_QUOTA_ENFORCEMENT_TOTAL: CounterVec = register_counter_vec!(
+        "tenant_quota_enforcement_total",
+        "Quota enforcement actions (blocked vs allowed in dry-run)",
+        &["tenant_id", "resource_type", "action"]  // action: "blocked", "dry_run_allowed"
     )
     .unwrap();
 }
@@ -557,4 +600,85 @@ pub fn record_circuit_breaker_trip(tenant_id: &str) {
         .with_label_values(&[tenant_id])
         .inc();
     update_circuit_breaker_state(tenant_id, true);
+}
+
+// =============================================================================
+// Quota Enforcement Metrics Helper Functions
+// =============================================================================
+
+// Thread-local cache for TenantMetricsConfig to avoid repeated env lookups
+thread_local! {
+    static QUOTA_METRICS_CONFIG: TenantMetricsConfig = TenantMetricsConfig::from_env();
+}
+
+/// Get the effective tenant_id for metrics based on cardinality config.
+///
+/// When `METAFUSE_TENANT_METRICS_INCLUDE_ID=true`, returns the actual tenant_id.
+/// Otherwise, returns "aggregated" to prevent cardinality explosion.
+fn effective_tenant_id(tenant_id: &str) -> String {
+    QUOTA_METRICS_CONFIG.with(|config| {
+        if config.include_tenant_id {
+            tenant_id.to_string()
+        } else {
+            "aggregated".to_string()
+        }
+    })
+}
+
+/// Record a quota check result (cardinality-aware)
+///
+/// Uses `TenantMetricsConfig` to determine whether to use actual tenant_id
+/// or "aggregated" placeholder in metric labels.
+pub fn record_quota_check(tenant_id: &str, resource_type: &str, result: &str) {
+    let effective_id = effective_tenant_id(tenant_id);
+    TENANT_QUOTA_CHECKS_TOTAL
+        .with_label_values(&[effective_id.as_str(), resource_type, result])
+        .inc();
+}
+
+/// Update the quota usage ratio for a tenant (cardinality-aware)
+///
+/// Uses `TenantMetricsConfig` to determine whether to use actual tenant_id
+/// or "aggregated" placeholder in metric labels.
+pub fn update_quota_usage_ratio(tenant_id: &str, resource_type: &str, ratio: f64) {
+    let effective_id = effective_tenant_id(tenant_id);
+    TENANT_QUOTA_USAGE_RATIO
+        .with_label_values(&[effective_id.as_str(), resource_type])
+        .set(ratio);
+}
+
+/// Record a quota enforcement action (cardinality-aware)
+///
+/// Uses `TenantMetricsConfig` to determine whether to use actual tenant_id
+/// or "aggregated" placeholder in metric labels.
+pub fn record_quota_enforcement(tenant_id: &str, resource_type: &str, action: &str) {
+    let effective_id = effective_tenant_id(tenant_id);
+    TENANT_QUOTA_ENFORCEMENT_TOTAL
+        .with_label_values(&[effective_id.as_str(), resource_type, action])
+        .inc();
+}
+
+/// Convenience function to record a successful quota check
+pub fn record_quota_check_ok(tenant_id: &str, resource_type: &str) {
+    record_quota_check(tenant_id, resource_type, "ok");
+}
+
+/// Convenience function to record a quota exceeded event
+pub fn record_quota_exceeded(tenant_id: &str, resource_type: &str) {
+    record_quota_check(tenant_id, resource_type, "exceeded");
+}
+
+/// Convenience function to record a quota soft limit warning
+pub fn record_quota_warning(tenant_id: &str, resource_type: &str) {
+    record_quota_check(tenant_id, resource_type, "warning");
+}
+
+/// Convenience function to record a blocked request due to quota
+pub fn record_quota_blocked(tenant_id: &str, resource_type: &str) {
+    record_quota_enforcement(tenant_id, resource_type, "blocked");
+}
+
+/// Convenience function to record a dry-run allowed request (would have been blocked)
+pub fn record_quota_dry_run_allowed(tenant_id: &str, resource_type: &str) {
+    record_quota_enforcement(tenant_id, resource_type, "dry_run_allowed");
 }
