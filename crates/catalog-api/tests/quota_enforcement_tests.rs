@@ -5,6 +5,11 @@
 //! - Dry-run mode behavior
 //! - Usage endpoint responses
 //! - Soft limit warnings at 80%
+//!
+//! Run with: `cargo test -p metafuse-catalog-api --features "api-keys,test-utils" --test quota_enforcement_tests`
+
+// This test module requires both api-keys and test-utils features
+#![cfg(all(feature = "api-keys", feature = "test-utils"))]
 
 use metafuse_catalog_api::control_plane::UpdateTenantRequest;
 use metafuse_catalog_api::test_utils::{
