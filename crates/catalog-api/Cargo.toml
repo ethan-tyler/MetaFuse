@@ -21,10 +21,12 @@ api-keys = ["bcrypt", "rand", "dashmap", "hex"]
 audit = []
 usage-analytics = ["dashmap"]
 classification = ["regex"]
+# v0.8.0: Quota enforcement
+quota-enforcement = ["api-keys"]
 # Enterprise bundle (all enterprise features)
 enterprise = ["audit", "usage-analytics", "classification"]
-# Production bundle (enterprise + security)
-production = ["enterprise", "rate-limiting", "api-keys", "metrics"]
+# Production bundle (enterprise + security + quotas)
+production = ["enterprise", "rate-limiting", "api-keys", "metrics", "quota-enforcement"]
 # Test utilities for integration tests
 test-utils = ["tempfile"]
 
