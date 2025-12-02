@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2024-12-02
+
+### Multi-Tenant Quota Enforcement
+
+This release implements comprehensive quota enforcement for the multi-tenant platform, completing foundational SaaS capabilities.
+
+#### Added
+
+- **Dataset Quota Enforcement**
+  - Quota check before dataset creation (`check_dataset_quota`)
+  - Soft limit warnings at 80% threshold (logged + returned in JSON response)
+  - Hard limit blocking when quota exceeded (HTTP 403)
+  - Zero/negative quotas treated as unlimited
+
+- **Dry-Run Mode for Safe Rollout**
+  - `METAFUSE_QUOTA_DRY_RUN=true` (default) - logs violations but doesn't block
+  - `METAFUSE_QUOTA_DRY_RUN=false` - enables actual enforcement
+  - Allows metering before enforcing in production
+
+- **Usage Endpoints**
+  - `GET /api/v1/admin/tenants/:id/usage` - Admin visibility into tenant usage
+  - `GET /api/v1/usage` - Tenant self-service usage check
+  - Returns: dataset_count, quota limits, usage_ratio, status (ok/warning/exceeded/unlimited)
+
+- **Prometheus Quota Metrics**
+  - `tenant_quota_checks_total` - Counter by result (ok, exceeded, warning)
+  - `tenant_quota_usage_ratio` - Gauge for current usage ratio per tenant
+  - `tenant_quota_enforcement_total` - Counter by action (blocked, dry_run_allowed)
+  - Cardinality control via `METAFUSE_TENANT_METRICS_INCLUDE_ID` environment variable
+
+- **Feature Flag**
+  - `quota-enforcement` feature flag for gradual rollout
+  - Included in `production` feature bundle
+
+#### Security
+
+- Admin usage endpoint requires platform admin authentication
+- Tenant usage endpoint requires valid API key with tenant context
+- RBAC enforced via existing middleware stack
+
+#### Migration Notes
+
+- No database migrations required
+- Existing tenants continue to work with their defined quota fields
+- Deploy with `METAFUSE_QUOTA_DRY_RUN=true` initially to monitor before enforcement
+
+---
+
 ### Phase 7: Multi-Region Foundation & Tenant Metrics
 
 This release adds tenant-level observability metrics and foundational multi-region support for control plane tenants.

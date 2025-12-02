@@ -3098,7 +3098,10 @@ fn check_dataset_quota(
     let quota_max = tenant.quota_max_datasets;
     let tenant_id = &tenant.tenant_id;
 
-    // Unlimited quota (0 or negative means no limit)
+    // Defensive check: treat 0 or negative as unlimited
+    // Note: The database has a CHECK constraint (quota_max_datasets > 0) that prevents
+    // storing invalid values. This check is defensive programming for edge cases like
+    // manual database modifications or future schema changes.
     if quota_max <= 0 {
         #[cfg(feature = "metrics")]
         metrics::record_quota_check_ok(tenant_id, "datasets");
