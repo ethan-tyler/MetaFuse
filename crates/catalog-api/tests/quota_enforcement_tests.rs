@@ -6,10 +6,10 @@
 //! - Usage endpoint responses
 //! - Soft limit warnings at 80%
 
+use metafuse_catalog_api::control_plane::UpdateTenantRequest;
 use metafuse_catalog_api::test_utils::{
     test_audit_context, TestApiKey, TestControlPlane, TestTenantBuilder,
 };
-use metafuse_catalog_api::control_plane::UpdateTenantRequest;
 
 mod quota_enforcement {
     use super::*;
@@ -95,7 +95,10 @@ mod quota_enforcement {
             .await;
 
         // Should fail with constraint violation
-        assert!(result.is_err(), "Zero quota should be rejected by CHECK constraint");
+        assert!(
+            result.is_err(),
+            "Zero quota should be rejected by CHECK constraint"
+        );
     }
 
     /// Test that negative quota is rejected by database constraint
@@ -125,7 +128,10 @@ mod quota_enforcement {
             .await;
 
         // Should fail with constraint violation
-        assert!(result.is_err(), "Negative quota should be rejected by CHECK constraint");
+        assert!(
+            result.is_err(),
+            "Negative quota should be rejected by CHECK constraint"
+        );
     }
 
     /// Test that minimum valid quota (1) is accepted

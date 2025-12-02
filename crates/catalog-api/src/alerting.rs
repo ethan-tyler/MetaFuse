@@ -772,9 +772,7 @@ pub async fn alert_check_task(
 
                     for channel in &channels {
                         // Strip webhook: prefix if present
-                        let url = channel
-                            .strip_prefix("webhook:")
-                            .unwrap_or(channel);
+                        let url = channel.strip_prefix("webhook:").unwrap_or(channel);
                         let redacted = redact_url(url);
 
                         match webhook_client
@@ -807,7 +805,11 @@ pub async fn alert_check_task(
                     }
 
                     // Update delivery status
-                    let status = if delivery_success { "delivered" } else { "failed" };
+                    let status = if delivery_success {
+                        "delivered"
+                    } else {
+                        "failed"
+                    };
                     if let Err(e) = update_delivery_status(
                         &conn,
                         alert_id,

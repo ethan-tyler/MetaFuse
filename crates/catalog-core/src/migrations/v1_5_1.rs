@@ -100,7 +100,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(count, 1, "idx_alert_history_tenant_created index should exist");
+        assert_eq!(
+            count, 1,
+            "idx_alert_history_tenant_created index should exist"
+        );
     }
 
     #[test]

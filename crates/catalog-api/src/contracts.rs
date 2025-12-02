@@ -161,7 +161,10 @@ pub fn validate_contract(contract: &DataContract) -> Vec<ContractValidationError
 /// Check if a string is a valid identifier (alphanumeric + underscore)
 fn is_valid_identifier(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -631,7 +634,11 @@ mod tests {
         };
 
         let errors = validate_contract(&contract);
-        assert!(errors.is_empty(), "Valid contract should pass: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "Valid contract should pass: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -735,9 +742,7 @@ mod tests {
 
         let errors = validate_contract(&contract);
         assert!(!errors.is_empty());
-        assert!(errors
-            .iter()
-            .any(|e| e.field.contains("min_completeness")));
+        assert!(errors.iter().any(|e| e.field.contains("min_completeness")));
     }
 
     #[test]
@@ -1102,9 +1107,9 @@ mod tests {
         // Update it
         let updated_contract = DataContract {
             id: None,
-            name: "to_update".to_string(), // Same name
+            name: "to_update".to_string(),         // Same name
             dataset_pattern: "sales*".to_string(), // Changed
-            version: 2, // Bumped version
+            version: 2,                            // Bumped version
             schema_contract: None,
             quality_contract: Some(QualityContract {
                 min_completeness: Some(0.95),

@@ -280,7 +280,10 @@ mod tests {
             [],
         );
 
-        assert!(result.is_err(), "Invalid alert_type should fail CHECK constraint");
+        assert!(
+            result.is_err(),
+            "Invalid alert_type should fail CHECK constraint"
+        );
     }
 
     #[test]

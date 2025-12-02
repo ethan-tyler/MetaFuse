@@ -1080,7 +1080,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Contract endpoints (v0.9.0)
     #[cfg(feature = "contracts")]
     let app = app
-        .route("/api/v1/contracts", get(list_contracts).post(create_contract))
+        .route(
+            "/api/v1/contracts",
+            get(list_contracts).post(create_contract),
+        )
         .route(
             "/api/v1/contracts/:name",
             get(get_contract)
@@ -6991,17 +6994,16 @@ async fn create_contract(
         .await
         .map_err(|e| internal_error(e.to_string(), request_id.0.clone()))?;
 
-    let id = contracts::create_contract(&conn, &contract)
-        .map_err(|e| {
-            if e.to_string().contains("UNIQUE constraint") {
-                bad_request(
-                    format!("Contract '{}' already exists", contract.name),
-                    request_id.0.clone(),
-                )
-            } else {
-                internal_error(e.to_string(), request_id.0.clone())
-            }
-        })?;
+    let id = contracts::create_contract(&conn, &contract).map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint") {
+            bad_request(
+                format!("Contract '{}' already exists", contract.name),
+                request_id.0.clone(),
+            )
+        } else {
+            internal_error(e.to_string(), request_id.0.clone())
+        }
+    })?;
 
     Ok(Json(ContractCreatedResponse {
         id,
