@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2025-12-03
+
+### Production-Ready Release
+
+MetaFuse v1.0.0 marks the first production-ready release, consolidating enterprise features developed over the past months into a stable, fully-tested platform.
+
+#### Added
+
+- **Data Quality Monitoring**
+  - `QualityCheckExecutor` with completeness, freshness, uniqueness check types
+  - Scheduled quality checks via background task (configurable interval)
+  - On-demand quality execution via `POST /datasets/:name/quality/execute`
+  - Quality check results with scores, thresholds, and detailed diagnostics
+  - Integration with Delta Lake metadata for accurate statistics
+
+- **Freshness Violation Detection**
+  - Automatic detection of stale datasets based on freshness config
+  - SLA-based violations (hourly, daily, weekly, custom)
+  - Grace period support with hours_overdue tracking
+  - Auto-resolution when datasets are updated
+  - `GET /datasets/:name/freshness/violations` endpoint
+
+- **Data Contract Evaluation Engine**
+  - `ContractEvaluator` for schema, quality, and freshness contracts
+  - Schema contracts: required columns, type checking, nullability constraints
+  - Type compatibility with common aliases (Int64/bigint, Utf8/string, etc.)
+  - Quality contracts: min_completeness, min_freshness, min_overall thresholds
+  - Freshness contracts: max_staleness_secs, expected_interval_secs
+  - Enforcement actions: `Allow`, `Warn`, `Block`, `Alert`
+  - Fail-open behavior for non-Delta datasets
+
+- **Production Hardening**
+  - Graceful shutdown with SIGINT/SIGTERM signal handling
+  - Multi-tenant cache cleanup on shutdown
+  - Kubernetes-compatible health endpoints:
+    - `GET /health` - Basic health check
+    - `GET /ready` - Readiness probe with database connectivity check
+    - `GET /live` - Liveness probe (always healthy if running)
+
+- **Audit Logging Expansion**
+  - Wired to quality check handlers (create, delete)
+  - Wired to classification handlers (set, scan)
+  - Wired to contract handlers (create, update, delete)
+  - Wired to lineage handlers (record edge)
+
+- **Usage Analytics Expansion**
+  - `list_datasets` - SearchAppearance tracking for browsing patterns
+  - `lineage_upstream` - LineageQuery tracking
+  - `lineage_downstream` - LineageQuery tracking
+  - `lineage_pii_propagation` - LineageQuery tracking
+
+#### Database Migrations
+
+- **v1.7.0**: Quality and freshness monitoring tables
+  - `quality_checks` - Check definitions with schedules and thresholds
+  - `quality_results` - Execution results with scores and diagnostics
+  - `freshness_violations` - Violation tracking with SLA and resolution
+  - Indexes for efficient querying by dataset, status, and time
+
+#### Testing
+
+- 87+ tests passing with `--all-features`
+- Enterprise feature integration tests
+- Contract evaluation tests (schema, quality, freshness)
+- Health endpoint tests
+
+---
+
 ## [0.10.0] - 2025-12-02
 
 ### Column-Level Lineage Release
