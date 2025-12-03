@@ -16,27 +16,79 @@ METAFUSE_PORT=3000 metafuse-api
 
 ## Authentication
 
-**Current (v0.1.x):** No authentication required. The API is open.
+**Current (v1.0.0):** API key authentication available via `--features api-keys`.
 
-**Future:** API key authentication and RBAC planned for Phase 4.
+When enabled, include the API key in the `X-API-Key` header:
+
+```bash
+curl -H "X-API-Key: your-api-key" http://localhost:8080/api/v1/datasets
+```
+
+**Multi-tenant Isolation:** Pass tenant ID via `X-Tenant-ID` header for tenant-scoped operations.
 
 ## Endpoints
 
-### Health Check
+### Health Endpoints
+
+MetaFuse provides Kubernetes-compatible health probes:
+
+#### Basic Health Check
 
 **GET /health**
 
-Check if the API server is running.
+Simple health check returning "ok" if the server is running.
+
+**Response:** `ok` (plain text)
+
+**Status Codes:**
+- `200 OK`: Server is running
+
+---
+
+#### Readiness Probe
+
+**GET /ready**
+
+Checks if the service is ready to accept traffic (verifies database connectivity).
 
 **Response:**
+
 ```json
 {
-  "status": "ok"
+  "status": "healthy",
+  "database": {
+    "status": "healthy",
+    "latency_ms": 2
+  },
+  "message": "Service is ready"
 }
 ```
 
 **Status Codes:**
-- `200 OK`: Server is healthy
+
+- `200 OK`: Service is ready
+- `503 Service Unavailable`: Service is not ready (e.g., database unreachable)
+
+---
+
+#### Liveness Probe
+
+**GET /live**
+
+Indicates if the application is alive and should not be restarted.
+
+**Response:**
+
+```json
+{
+  "status": "healthy",
+  "message": "Service is alive"
+}
+```
+
+**Status Codes:**
+
+- `200 OK`: Service is alive
 
 ---
 

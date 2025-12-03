@@ -9,7 +9,7 @@
 
 MetaFuse captures dataset schemas, lineage, and operational metadata automatically from your data pipelines without requiring Kafka, MySQL, or Elasticsearch. Just a SQLite file on object storage.
 
-**Status:** v0.3.0 Cloud-Ready — Production-hardened with GCS and S3 backends. Supports local SQLite, Google Cloud Storage, and AWS S3 with optimistic concurrency and caching.
+**Status:** v1.0.0 Production-Ready — Enterprise features including data quality checks, freshness monitoring, data contracts, audit logging, usage analytics, column-level lineage, and Kubernetes-compatible health probes.
 
 ## Why MetaFuse?
 
@@ -18,10 +18,15 @@ MetaFuse captures dataset schemas, lineage, and operational metadata automatical
 - **Zero infrastructure** - No databases, no clusters to maintain
 - **Multi-cloud** - Works on local filesystem, Google Cloud Storage, and AWS S3
 - **Automatic lineage capture** - Track data flow through transformations
+- **Column-level lineage** - Trace PII propagation and impact analysis
+- **Data quality monitoring** - Completeness, freshness, and custom checks
+- **Data contracts** - Schema, quality, and freshness SLA enforcement
+- **Alerting system** - Webhook delivery with exponential backoff
 - **Full-text search with FTS5** - Fast search with automatic trigger maintenance
 - **Optimistic concurrency** - Safe concurrent writes with version-based locking
-- **Tags and glossary** - Organize with business context
-- **Operational metadata** - Track row counts, sizes, partition keys
+- **Audit logging** - Track all catalog mutations with context
+- **Usage analytics** - Understand which datasets are most valuable
+- **Kubernetes-ready** - `/ready` and `/live` health probes
 
 MetaFuse fills the gap between expensive, complex enterprise catalogs (DataHub, Collibra) and the needs of small-to-medium data teams.
 
@@ -87,11 +92,15 @@ MetaFuse supports multiple storage backends:
 - **`METAFUSE_PORT`**: API server port (default: 8080)
 - **`METAFUSE_RUN_MIGRATIONS`**: Set to `true` to auto-run migrations on startup
 
-**Enterprise Features (v0.6.0+):**
+**Enterprise Features (v1.0.0):**
 
 - **`METAFUSE_AUDIT_BATCH_SIZE`**: Max events per audit DB write batch (default: 100)
 - **`METAFUSE_AUDIT_FLUSH_INTERVAL_MS`**: Audit flush interval in ms (default: 5000)
 - **`METAFUSE_USAGE_FLUSH_INTERVAL_MS`**: Usage counter flush interval in ms (default: 60000)
+- **`METAFUSE_QUALITY_CHECK_INTERVAL_SECS`**: Scheduled quality check interval (default: 60)
+- **`METAFUSE_FRESHNESS_CHECK_INTERVAL_SECS`**: Freshness violation check interval (default: 60)
+- **`METAFUSE_ALERT_CHECK_INTERVAL_SECS`**: Alert dispatch check interval (default: 60)
+- **`METAFUSE_SHUTDOWN_TIMEOUT_SECS`**: Graceful shutdown timeout (default: 30)
 
 #### Examples
 
@@ -223,10 +232,27 @@ println!("Applied {} migrations", migrations_applied);
 ```bash
 cargo run --bin metafuse-api
 
-# Query endpoints
+# Core endpoints
 curl http://localhost:8080/api/v1/datasets
 curl http://localhost:8080/api/v1/datasets/active_records
 curl "http://localhost:8080/api/v1/search?q=analytics"
+
+# Health probes (Kubernetes-compatible)
+curl http://localhost:8080/health  # Basic health check
+curl http://localhost:8080/ready   # Readiness probe (checks DB)
+curl http://localhost:8080/live    # Liveness probe
+
+# Quality checks (feature: quality)
+curl http://localhost:8080/api/v1/datasets/active_records/quality
+curl -X POST http://localhost:8080/api/v1/datasets/active_records/quality/execute
+
+# Data contracts (feature: contracts)
+curl http://localhost:8080/api/v1/contracts
+curl http://localhost:8080/api/v1/contracts/my_contract
+
+# Lineage (feature: column-lineage)
+curl http://localhost:8080/api/v1/lineage/dataset/1/upstream
+curl http://localhost:8080/api/v1/lineage/dataset/1/downstream
 ```
 
 ### Try the Examples
@@ -362,6 +388,10 @@ MetaFuse/
 | **Infrastructure** | None | Kafka, MySQL, ES | AWS only |
 | **DataFusion Integration** | Native | Via connector | No |
 | **Local Development** | Yes | No | No |
+| **Data Quality** | Built-in | Plugin | Separate |
+| **Data Contracts** | Built-in | Plugin | No |
+| **Column Lineage** | Built-in | Built-in | Limited |
+| **Alerting** | Built-in | Built-in | CloudWatch |
 
 ## Contributing
 
